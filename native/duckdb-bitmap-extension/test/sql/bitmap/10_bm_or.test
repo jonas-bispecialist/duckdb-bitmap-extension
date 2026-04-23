@@ -1,0 +1,14 @@
+# bm_or contract
+#
+# Enable this file after the BitmapOr binding exists.
+#
+# Expected semantics:
+# - union of two compatible CRoaring-compatible bitmap blobs
+# - NULL-preserving for the SQL binding
+# - result uses the same FPBM envelope
+#
+# Cases to enable later:
+# - empty OR empty => empty
+# - singleton OR singleton => two-element union when distinct
+# - overlapping sets do not duplicate row ids
+

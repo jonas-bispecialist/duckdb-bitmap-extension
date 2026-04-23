@@ -1,0 +1,2 @@
+-- Optional fixture setup for the case.
+-- Keep the data set small and deterministic.

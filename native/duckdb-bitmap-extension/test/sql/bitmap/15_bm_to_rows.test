@@ -1,0 +1,13 @@
+# bm_to_rows contract
+#
+# Enable this file after the BitmapToRows table-function binding exists.
+#
+# Expected semantics:
+# - emits one BIGINT row per contained row id
+# - output order should be deterministic for a given payload
+# - NULL bitmap input yields zero rows
+#
+# Cases to enable later:
+# - empty bitmap -> zero rows
+# - singleton bitmap -> one row
+# - multi-value bitmap -> one row per contained id

@@ -1,0 +1,21 @@
+# Bitmap blob envelope contract
+#
+# This file documents the format assumptions for the V1 bitmap BLOB wrapper.
+# It is intentionally scaffold-only and should be enabled once the blob helpers
+# are wired into a real DuckDB extension entry point.
+#
+# Envelope layout:
+#   bytes 0..3   magic = "FPBM"
+#   byte  4      format version = 1
+#   byte  5      payload encoding = 1 (CRoaring portable serialization)
+#   bytes 6..7   reserved = 0
+#   bytes 8..11  payload length
+#   bytes 12..N  CRoaring portable payload
+#
+# Cases to enable later:
+# - valid empty payload round-trips
+# - invalid magic is rejected
+# - invalid version is rejected
+# - payload length mismatch is rejected
+# - payload bytes are preserved exactly
+

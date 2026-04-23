@@ -1,0 +1,14 @@
+# bm_contains contract
+#
+# Enable this file after the BitmapContains binding exists.
+#
+# Expected semantics:
+# - returns whether a row id is present in the bitmap
+# - NULL bitmap input yields NULL
+# - row ids use the same unsigned 64-bit domain as the bitmap payload
+#
+# Cases to enable later:
+# - contains present row id -> true
+# - contains absent row id -> false
+# - contains on empty bitmap -> false
+

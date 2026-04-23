@@ -1,0 +1,14 @@
+# bm_andnot contract
+#
+# Enable this file after the BitmapAndNot binding exists.
+#
+# Expected semantics:
+# - left minus right over compatible CRoaring-compatible bitmap blobs
+# - NULL-preserving for the SQL binding
+# - result uses the same FPBM envelope
+#
+# Cases to enable later:
+# - empty minus empty => empty
+# - singleton minus same singleton => empty
+# - singleton minus disjoint singleton => original singleton
+

@@ -1,0 +1,14 @@
+# bm_count contract
+#
+# Enable this file after the BitmapCount binding exists.
+#
+# Expected semantics:
+# - returns the cardinality of the decoded bitmap
+# - NULL input yields NULL
+# - empty bitmap yields 0
+#
+# Cases to enable later:
+# - empty bitmap -> 0
+# - singleton bitmap -> 1
+# - multi-value bitmap -> exact count
+

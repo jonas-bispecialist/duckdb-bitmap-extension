@@ -1,0 +1,14 @@
+# bm_and contract
+#
+# Enable this file after the BitmapAnd binding exists.
+#
+# Expected semantics:
+# - intersection of two compatible CRoaring-compatible bitmap blobs
+# - NULL-preserving for the SQL binding
+# - result uses the same FPBM envelope
+#
+# Cases to enable later:
+# - disjoint inputs => empty
+# - partial overlap => common row ids only
+# - identical inputs => identical output
+

@@ -1,0 +1,2 @@
+SELECT 1 AS value
+ORDER BY 1;
