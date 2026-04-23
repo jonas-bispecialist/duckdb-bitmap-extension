@@ -81,9 +81,9 @@ Latest validated run (SF=1, warmup=1, iterations=3):
 - `04_bitmap_facet_shipmode`: `250.718 ms`
 - `05_bitmap_export_rowids`: `766.742 ms`
 
-CSV report:
+CSV reports (generated locally, not committed):
 
-- `tools/bitmap-ext/perf/out/perf-report-20260423-192602.csv`
+- `tools/bitmap-ext/perf/out/`
 
 ## Sub-Agent Coordination Summary
 
@@ -111,4 +111,3 @@ Final independent verification by a dedicated test agent passed:
 
 - Replace MVP sorted-array bitmap internals with CRoaring-backed operations while keeping the same SQL surface and harnesses.
 - Re-run the same perf harness after each optimization pass to confirm improvements.
-

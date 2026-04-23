@@ -1,0 +1,19 @@
+# Local DuckDB databases and temp files
+*.duckdb
+*.duckdb.wal
+*.duckdb.tmp
+
+# Native extension build outputs
+native/duckdb-bitmap-extension/build/
+
+# Benchmark artifacts
+tools/bitmap-ext/perf/out/
+tools/bitmap-ext/perf/*.duckdb
+
+# Python cache
+__pycache__/
+*.pyc
+
+# .NET build outputs
+**/bin/
+**/obj/
