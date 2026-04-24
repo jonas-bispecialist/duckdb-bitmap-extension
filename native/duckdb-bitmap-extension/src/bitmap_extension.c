@@ -366,17 +366,26 @@ static bool BitmapContainsValue(const BitmapView *view, uint64_t needle) {
     }
 
     uint32_t target = (uint32_t)needle;
-    idx_t low = 0;
-    idx_t high = view->count;
-    while (low < high) {
-        idx_t mid = low + ((high - low) / 2);
-        if (BitmapViewValueAt(view, mid) < target) {
-            low = mid + 1;
-        } else {
-            high = mid;
+
+    if (view->encoding == BITMAP_ENCODING_SORTED_U32) {
+        idx_t low = 0;
+        idx_t high = view->count;
+        while (low < high) {
+            idx_t mid = low + ((high - low) / 2);
+            if (BitmapViewValueAt(view, mid) < target) {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
         }
+        return low < view->count && BitmapViewValueAt(view, low) == target;
     }
-    return low < view->count && BitmapViewValueAt(view, low) == target;
+
+    roaring_bitmap_t *rb = BitmapViewDeserializeRoaring(view);
+    if (rb == NULL) return false;
+    bool result = roaring_bitmap_contains(rb, target);
+    roaring_bitmap_free(rb);
+    return result;
 }
 
 static idx_t BitmapLowerBoundGreaterThan(const BitmapView *view, int64_t start_after) {
@@ -722,17 +731,27 @@ static void BitmapOrFunction(duckdb_function_info info, duckdb_data_chunk input,
         if (!ParseBitmapBlob(info, rhs_vector, row, &rhs)) {
             return;
         }
-        uint32_t *result_values = NULL;
-        idx_t result_count = 0;
-        if (!ApplyBinaryOp(&lhs, &rhs, BITMAP_OP_OR, &result_values, &result_count)) {
-            SetFunctionError(info, "out of memory while computing bitmap union");
+
+        roaring_bitmap_t *rb_lhs = BitmapViewToRoaring(&lhs);
+        if (rb_lhs == NULL) {
+            SetFunctionError(info, "out of memory while converting bitmap to roaring");
+            return;
+        }
+        roaring_bitmap_t *rb_rhs = BitmapViewToRoaring(&rhs);
+        if (rb_rhs == NULL) {
+            roaring_bitmap_free(rb_lhs);
+            SetFunctionError(info, "out of memory while converting bitmap to roaring");
             return;
         }
 
+        roaring_bitmap_t *result = roaring_bitmap_or(rb_lhs, rb_rhs);
+        roaring_bitmap_free(rb_lhs);
+        roaring_bitmap_free(rb_rhs);
+
         uint8_t *blob_bytes = NULL;
         idx_t blob_size = 0;
-        if (!MakeBitmapBlobBytes(result_values, result_count, &blob_bytes, &blob_size)) {
-            free(result_values);
+        if (!MakeRoaringBlobBytes(result, &blob_bytes, &blob_size)) {
+            roaring_bitmap_free(result);
             SetFunctionError(info, "out of memory while serializing bitmap union");
             return;
         }
@@ -740,7 +759,7 @@ static void BitmapOrFunction(duckdb_function_info info, duckdb_data_chunk input,
         duckdb_vector_assign_string_element_len(output, row, (const char *)blob_bytes, blob_size);
 
         free(blob_bytes);
-        free(result_values);
+        roaring_bitmap_free(result);
     }
 }
 
@@ -776,17 +795,27 @@ static void BitmapAndFunction(duckdb_function_info info, duckdb_data_chunk input
         if (!ParseBitmapBlob(info, rhs_vector, row, &rhs)) {
             return;
         }
-        uint32_t *result_values = NULL;
-        idx_t result_count = 0;
-        if (!ApplyBinaryOp(&lhs, &rhs, BITMAP_OP_AND, &result_values, &result_count)) {
-            SetFunctionError(info, "out of memory while computing bitmap intersection");
+
+        roaring_bitmap_t *rb_lhs = BitmapViewToRoaring(&lhs);
+        if (rb_lhs == NULL) {
+            SetFunctionError(info, "out of memory while converting bitmap to roaring");
+            return;
+        }
+        roaring_bitmap_t *rb_rhs = BitmapViewToRoaring(&rhs);
+        if (rb_rhs == NULL) {
+            roaring_bitmap_free(rb_lhs);
+            SetFunctionError(info, "out of memory while converting bitmap to roaring");
             return;
         }
 
+        roaring_bitmap_t *result = roaring_bitmap_and(rb_lhs, rb_rhs);
+        roaring_bitmap_free(rb_lhs);
+        roaring_bitmap_free(rb_rhs);
+
         uint8_t *blob_bytes = NULL;
         idx_t blob_size = 0;
-        if (!MakeBitmapBlobBytes(result_values, result_count, &blob_bytes, &blob_size)) {
-            free(result_values);
+        if (!MakeRoaringBlobBytes(result, &blob_bytes, &blob_size)) {
+            roaring_bitmap_free(result);
             SetFunctionError(info, "out of memory while serializing bitmap intersection");
             return;
         }
@@ -794,7 +823,7 @@ static void BitmapAndFunction(duckdb_function_info info, duckdb_data_chunk input
         duckdb_vector_assign_string_element_len(output, row, (const char *)blob_bytes, blob_size);
 
         free(blob_bytes);
-        free(result_values);
+        roaring_bitmap_free(result);
     }
 }
 
@@ -830,17 +859,27 @@ static void BitmapAndNotFunction(duckdb_function_info info, duckdb_data_chunk in
         if (!ParseBitmapBlob(info, rhs_vector, row, &rhs)) {
             return;
         }
-        uint32_t *result_values = NULL;
-        idx_t result_count = 0;
-        if (!ApplyBinaryOp(&lhs, &rhs, BITMAP_OP_ANDNOT, &result_values, &result_count)) {
-            SetFunctionError(info, "out of memory while computing bitmap difference");
+
+        roaring_bitmap_t *rb_lhs = BitmapViewToRoaring(&lhs);
+        if (rb_lhs == NULL) {
+            SetFunctionError(info, "out of memory while converting bitmap to roaring");
+            return;
+        }
+        roaring_bitmap_t *rb_rhs = BitmapViewToRoaring(&rhs);
+        if (rb_rhs == NULL) {
+            roaring_bitmap_free(rb_lhs);
+            SetFunctionError(info, "out of memory while converting bitmap to roaring");
             return;
         }
 
+        roaring_bitmap_t *result = roaring_bitmap_andnot(rb_lhs, rb_rhs);
+        roaring_bitmap_free(rb_lhs);
+        roaring_bitmap_free(rb_rhs);
+
         uint8_t *blob_bytes = NULL;
         idx_t blob_size = 0;
-        if (!MakeBitmapBlobBytes(result_values, result_count, &blob_bytes, &blob_size)) {
-            free(result_values);
+        if (!MakeRoaringBlobBytes(result, &blob_bytes, &blob_size)) {
+            roaring_bitmap_free(result);
             SetFunctionError(info, "out of memory while serializing bitmap difference");
             return;
         }
@@ -848,7 +887,7 @@ static void BitmapAndNotFunction(duckdb_function_info info, duckdb_data_chunk in
         duckdb_vector_assign_string_element_len(output, row, (const char *)blob_bytes, blob_size);
 
         free(blob_bytes);
-        free(result_values);
+        roaring_bitmap_free(result);
     }
 }
 
@@ -918,17 +957,32 @@ static void BitmapCountBinaryCommon(duckdb_function_info info, duckdb_data_chunk
             return;
         }
 
+        roaring_bitmap_t *rb_lhs = BitmapViewToRoaring(&lhs);
+        if (rb_lhs == NULL) {
+            SetFunctionError(info, "out of memory while converting bitmap to roaring");
+            return;
+        }
+        roaring_bitmap_t *rb_rhs = BitmapViewToRoaring(&rhs);
+        if (rb_rhs == NULL) {
+            roaring_bitmap_free(rb_lhs);
+            SetFunctionError(info, "out of memory while converting bitmap to roaring");
+            return;
+        }
+
         switch (op) {
         case BITMAP_OP_OR:
-            out_data[row] = CountOr(&lhs, &rhs);
+            out_data[row] = roaring_bitmap_or_cardinality(rb_lhs, rb_rhs);
             break;
         case BITMAP_OP_AND:
-            out_data[row] = CountAnd(&lhs, &rhs);
+            out_data[row] = roaring_bitmap_and_cardinality(rb_lhs, rb_rhs);
             break;
         case BITMAP_OP_ANDNOT:
-            out_data[row] = CountAndNot(&lhs, &rhs);
+            out_data[row] = roaring_bitmap_andnot_cardinality(rb_lhs, rb_rhs);
             break;
         }
+
+        roaring_bitmap_free(rb_lhs);
+        roaring_bitmap_free(rb_rhs);
     }
 }
 
@@ -942,6 +996,58 @@ static void BitmapCountAndFunction(duckdb_function_info info, duckdb_data_chunk 
 
 static void BitmapCountAndNotFunction(duckdb_function_info info, duckdb_data_chunk input, duckdb_vector output) {
     BitmapCountBinaryCommon(info, input, output, BITMAP_OP_ANDNOT);
+}
+
+static void BitmapReencodeRoaringFunction(duckdb_function_info info, duckdb_data_chunk input, duckdb_vector output) {
+    idx_t row_count = duckdb_data_chunk_get_size(input);
+    duckdb_vector bitmap_vector = duckdb_data_chunk_get_vector(input, 0);
+    uint64_t *input_validity = duckdb_vector_get_validity(bitmap_vector);
+    bool has_null = false;
+    for (idx_t row = 0; row < row_count; row++) {
+        if (!RowIsValid(input_validity, row)) {
+            has_null = true;
+            break;
+        }
+    }
+    if (has_null) {
+        duckdb_vector_ensure_validity_writable(output);
+    }
+    uint64_t *output_validity = duckdb_vector_get_validity(output);
+
+    for (idx_t row = 0; row < row_count; row++) {
+        if (!RowIsValid(input_validity, row)) {
+            duckdb_validity_set_row_invalid(output_validity, row);
+            continue;
+        }
+
+        BitmapView bitmap = {0};
+        if (!ParseBitmapBlob(info, bitmap_vector, row, &bitmap)) {
+            return;
+        }
+
+        if (bitmap.encoding == BITMAP_ENCODING_ROARING32) {
+            const uint8_t *blob_data = NULL;
+            idx_t blob_size = 0;
+            blob_data = BlobDataAt(bitmap_vector, row, &blob_size);
+            duckdb_vector_assign_string_element_len(output, row, (const char *)blob_data, blob_size);
+        } else {
+            roaring_bitmap_t *rb = BitmapViewToRoaring(&bitmap);
+            if (rb == NULL) {
+                SetFunctionError(info, "out of memory while re-encoding bitmap");
+                return;
+            }
+            uint8_t *blob_bytes = NULL;
+            idx_t blob_size = 0;
+            if (!MakeRoaringBlobBytes(rb, &blob_bytes, &blob_size)) {
+                roaring_bitmap_free(rb);
+                SetFunctionError(info, "out of memory while serializing re-encoded bitmap");
+                return;
+            }
+            duckdb_vector_assign_string_element_len(output, row, (const char *)blob_bytes, blob_size);
+            free(blob_bytes);
+            roaring_bitmap_free(rb);
+        }
+    }
 }
 
 static void BitmapIntersectsFunction(duckdb_function_info info, duckdb_data_chunk input, duckdb_vector output) {
@@ -977,7 +1083,23 @@ static void BitmapIntersectsFunction(duckdb_function_info info, duckdb_data_chun
         if (!ParseBitmapBlob(info, rhs_vector, row, &rhs)) {
             return;
         }
-        out_data[row] = BitmapsIntersect(&lhs, &rhs);
+
+        roaring_bitmap_t *rb_lhs = BitmapViewToRoaring(&lhs);
+        if (rb_lhs == NULL) {
+            SetFunctionError(info, "out of memory while converting bitmap to roaring");
+            return;
+        }
+        roaring_bitmap_t *rb_rhs = BitmapViewToRoaring(&rhs);
+        if (rb_rhs == NULL) {
+            roaring_bitmap_free(rb_lhs);
+            SetFunctionError(info, "out of memory while converting bitmap to roaring");
+            return;
+        }
+
+        out_data[row] = roaring_bitmap_intersect(rb_lhs, rb_rhs);
+
+        roaring_bitmap_free(rb_lhs);
+        roaring_bitmap_free(rb_rhs);
     }
 }
 
@@ -1016,8 +1138,13 @@ static void BitmapContainsFunction(duckdb_function_info info, duckdb_data_chunk 
 }
 
 static const char *BitmapFormatName(const BitmapView *bitmap) {
-    if (bitmap->version == BITMAP_FORMAT_VERSION && bitmap->encoding == BITMAP_ENCODING_SORTED_U32) {
-        return "sorted_u32_v1";
+    if (bitmap->version == BITMAP_FORMAT_VERSION) {
+        if (bitmap->encoding == BITMAP_ENCODING_SORTED_U32) {
+            return "sorted_u32_v1";
+        }
+        if (bitmap->encoding == BITMAP_ENCODING_ROARING32) {
+            return "roaring32_v1";
+        }
     }
     return "unknown";
 }
@@ -1079,14 +1206,37 @@ static void BitmapStatsFunction(duckdb_function_info info, duckdb_data_chunk inp
             return;
         }
 
-        char stats[160];
-        int written = snprintf(stats, sizeof(stats),
-                               "encoding=%s;cardinality=%llu;serialized_bytes=%llu;payload_bytes=%llu",
-                               BitmapFormatName(&bitmap), (unsigned long long)bitmap.count,
-                               (unsigned long long)bitmap.total_size, (unsigned long long)bitmap.payload_size);
-        if (written < 0 || (size_t)written >= sizeof(stats)) {
-            SetFunctionError(info, "failed to format bitmap stats");
-            return;
+        char stats[512];
+        if (bitmap.encoding == BITMAP_ENCODING_SORTED_U32) {
+            int written = snprintf(stats, sizeof(stats),
+                                   "encoding=%s;cardinality=%llu;serialized_bytes=%llu;payload_bytes=%llu",
+                                   BitmapFormatName(&bitmap), (unsigned long long)bitmap.count,
+                                   (unsigned long long)bitmap.total_size, (unsigned long long)bitmap.payload_size);
+            if (written < 0 || (size_t)written >= sizeof(stats)) {
+                SetFunctionError(info, "failed to format bitmap stats");
+                return;
+            }
+        } else {
+            roaring_bitmap_t *rb = BitmapViewDeserializeRoaring(&bitmap);
+            if (rb == NULL) {
+                SetFunctionError(info, "failed to deserialize roaring bitmap for stats");
+                return;
+            }
+            uint64_t card = roaring_bitmap_get_cardinality(rb);
+            roaring_statistics_t roar_stats;
+            roaring_bitmap_statistics(rb, &roar_stats);
+            int written = snprintf(stats, sizeof(stats),
+                                   "encoding=%s;cardinality=%llu;serialized_bytes=%llu;payload_bytes=%llu;"
+                                   "containers=%u;array=%u;run=%u;bitset=%u",
+                                   BitmapFormatName(&bitmap), (unsigned long long)card,
+                                   (unsigned long long)bitmap.total_size, (unsigned long long)bitmap.payload_size,
+                                   roar_stats.n_containers, roar_stats.n_array_containers,
+                                   roar_stats.n_run_containers, roar_stats.n_bitset_containers);
+            roaring_bitmap_free(rb);
+            if (written < 0 || (size_t)written >= sizeof(stats)) {
+                SetFunctionError(info, "failed to format bitmap stats");
+                return;
+            }
         }
         duckdb_vector_assign_string_element(output, row, stats);
     }
@@ -1108,11 +1258,12 @@ static void BitmapToRowsFunction(duckdb_function_info info, duckdb_data_chunk in
         if (!ParseBitmapBlob(info, bitmap_vector, row, &bitmap)) {
             return;
         }
-        if (total_rows > (idx_t)(SIZE_MAX - bitmap.count)) {
+        uint64_t card = BitmapViewCardinality(&bitmap);
+        if (total_rows > (idx_t)(SIZE_MAX - card)) {
             SetFunctionError(info, "bitmap row output exceeds supported size");
             return;
         }
-        total_rows += bitmap.count;
+        total_rows += card;
     }
 
     if (has_null) {
@@ -1145,12 +1296,32 @@ static void BitmapToRowsFunction(duckdb_function_info info, duckdb_data_chunk in
         if (!ParseBitmapBlob(info, bitmap_vector, row, &bitmap)) {
             return;
         }
-        out_entries[row].offset = (uint64_t)child_offset;
-        out_entries[row].length = (uint64_t)bitmap.count;
-        for (idx_t i = 0; i < bitmap.count; i++) {
-            child_data[child_offset + i] = (uint64_t)BitmapViewValueAt(&bitmap, i);
+
+        if (bitmap.encoding == BITMAP_ENCODING_SORTED_U32) {
+            out_entries[row].offset = (uint64_t)child_offset;
+            out_entries[row].length = (uint64_t)bitmap.count;
+            for (idx_t i = 0; i < bitmap.count; i++) {
+                child_data[child_offset + i] = (uint64_t)BitmapViewValueAt(&bitmap, i);
+            }
+            child_offset += bitmap.count;
+        } else {
+            roaring_bitmap_t *rb = BitmapViewDeserializeRoaring(&bitmap);
+            if (rb == NULL) {
+                SetFunctionError(info, "failed to deserialize roaring bitmap");
+                return;
+            }
+            roaring_uint32_iterator_t *it = roaring_iterator_create(rb);
+            out_entries[row].offset = (uint64_t)child_offset;
+            idx_t i = 0;
+            while (roaring_uint32_iterator_has_value(it)) {
+                child_data[child_offset + i++] = (uint64_t)roaring_uint32_iterator_value(it);
+                roaring_uint32_iterator_advance(it);
+            }
+            out_entries[row].length = (uint64_t)i;
+            roaring_uint32_iterator_free(it);
+            roaring_bitmap_free(rb);
+            child_offset += i;
         }
-        child_offset += bitmap.count;
     }
 }
 
@@ -1179,10 +1350,35 @@ static void BitmapToRowsLimitedFunction(duckdb_function_info info, duckdb_data_c
             return;
         }
 
-        idx_t start = BitmapLowerBoundGreaterThan(&bitmap, start_after_data[row]);
-        idx_t remaining = bitmap.count - start;
+        int64_t threshold = start_after_data[row];
         idx_t limit = limit_data[row] > (uint64_t)SIZE_MAX ? (idx_t)SIZE_MAX : (idx_t)limit_data[row];
-        idx_t emit_count = remaining < limit ? remaining : limit;
+        idx_t emit_count = 0;
+
+        if (bitmap.encoding == BITMAP_ENCODING_SORTED_U32) {
+            idx_t start = BitmapLowerBoundGreaterThan(&bitmap, threshold);
+            idx_t remaining = bitmap.count - start;
+            emit_count = remaining < limit ? remaining : limit;
+        } else {
+            roaring_bitmap_t *rb = BitmapViewDeserializeRoaring(&bitmap);
+            if (rb == NULL) {
+                SetFunctionError(info, "failed to deserialize roaring bitmap for limit");
+                return;
+            }
+            uint32_t threshold_u32 = (threshold < 0 || (uint64_t)threshold >= UINT32_MAX) ? UINT32_MAX : (uint32_t)(threshold + 1);
+            roaring_uint32_iterator_t *it = roaring_iterator_create(rb);
+            if (threshold_u32 < UINT32_MAX) {
+                while (roaring_uint32_iterator_has_value(it) && roaring_uint32_iterator_value(it) < threshold_u32) {
+                    roaring_uint32_iterator_advance(it);
+                }
+            }
+            while (roaring_uint32_iterator_has_value(it) && emit_count < limit) {
+                emit_count++;
+                roaring_uint32_iterator_advance(it);
+            }
+            roaring_uint32_iterator_free(it);
+            roaring_bitmap_free(rb);
+        }
+
         if (total_rows > (idx_t)(SIZE_MAX - emit_count)) {
             SetFunctionError(info, "bitmap row output exceeds supported size");
             return;
@@ -1222,17 +1418,42 @@ static void BitmapToRowsLimitedFunction(duckdb_function_info info, duckdb_data_c
             return;
         }
 
-        idx_t start = BitmapLowerBoundGreaterThan(&bitmap, start_after_data[row]);
-        idx_t remaining = bitmap.count - start;
+        int64_t threshold = start_after_data[row];
         idx_t limit = limit_data[row] > (uint64_t)SIZE_MAX ? (idx_t)SIZE_MAX : (idx_t)limit_data[row];
-        idx_t emit_count = remaining < limit ? remaining : limit;
-
         out_entries[row].offset = (uint64_t)child_offset;
-        out_entries[row].length = (uint64_t)emit_count;
-        for (idx_t i = 0; i < emit_count; i++) {
-            child_data[child_offset + i] = (uint64_t)BitmapViewValueAt(&bitmap, start + i);
+        idx_t i = 0;
+
+        if (bitmap.encoding == BITMAP_ENCODING_SORTED_U32) {
+            idx_t start = BitmapLowerBoundGreaterThan(&bitmap, threshold);
+            idx_t remaining = bitmap.count - start;
+            idx_t emit_count = remaining < limit ? remaining : limit;
+            for (idx_t j = 0; j < emit_count; j++) {
+                child_data[child_offset + j] = (uint64_t)BitmapViewValueAt(&bitmap, start + j);
+            }
+            i = emit_count;
+        } else {
+            roaring_bitmap_t *rb = BitmapViewDeserializeRoaring(&bitmap);
+            if (rb == NULL) {
+                SetFunctionError(info, "failed to deserialize roaring bitmap");
+                return;
+            }
+            uint32_t threshold_u32 = (threshold < 0 || (uint64_t)threshold >= UINT32_MAX) ? UINT32_MAX : (uint32_t)(threshold + 1);
+            roaring_uint32_iterator_t *it = roaring_iterator_create(rb);
+            if (threshold_u32 < UINT32_MAX) {
+                while (roaring_uint32_iterator_has_value(it) && roaring_uint32_iterator_value(it) < threshold_u32) {
+                    roaring_uint32_iterator_advance(it);
+                }
+            }
+            while (roaring_uint32_iterator_has_value(it) && i < limit) {
+                child_data[child_offset + i++] = (uint64_t)roaring_uint32_iterator_value(it);
+                roaring_uint32_iterator_advance(it);
+            }
+            roaring_uint32_iterator_free(it);
+            roaring_bitmap_free(rb);
         }
-        child_offset += emit_count;
+
+        out_entries[row].length = (uint64_t)i;
+        child_offset += i;
     }
 }
 
@@ -1271,52 +1492,34 @@ static void BitmapBuildFunction(duckdb_function_info info, duckdb_data_chunk inp
             SetFunctionError(info, "bm_build received invalid LIST offsets");
             return;
         }
-        if (length > (idx_t)(SIZE_MAX / sizeof(uint32_t))) {
-            SetFunctionError(info, "bm_build input list is too large");
-            return;
-        }
 
-        uint32_t *values = NULL;
-        if (length > 0) {
-            values = (uint32_t *)malloc((size_t)length * sizeof(uint32_t));
-            if (values == NULL) {
-                SetFunctionError(info, "out of memory while building bitmap");
-                return;
-            }
+        roaring_bitmap_t *rb = roaring_bitmap_create();
+        if (rb == NULL) {
+            SetFunctionError(info, "out of memory while building bitmap");
+            return;
         }
 
         for (idx_t i = 0; i < length; i++) {
             idx_t child_index = offset + i;
             if (!RowIsValid(child_validity, child_index)) {
-                free(values);
+                roaring_bitmap_free(rb);
                 SetFunctionError(info, "bm_build does not accept NULL row ids");
                 return;
             }
 
             uint64_t row_id = child_data[child_index];
             if (row_id > UINT32_MAX) {
-                free(values);
+                roaring_bitmap_free(rb);
                 SetFunctionError(info, "bm_build row id exceeds UINT32 range");
                 return;
             }
-            values[i] = (uint32_t)row_id;
-        }
-
-        if (length > 1) {
-            qsort(values, (size_t)length, sizeof(uint32_t), CompareUint32);
-        }
-
-        idx_t unique_count = 0;
-        for (idx_t i = 0; i < length; i++) {
-            if (i == 0 || values[i] != values[i - 1]) {
-                values[unique_count++] = values[i];
-            }
+            roaring_bitmap_add(rb, (uint32_t)row_id);
         }
 
         uint8_t *blob_bytes = NULL;
         idx_t blob_size = 0;
-        if (!MakeBitmapBlobBytes(values, unique_count, &blob_bytes, &blob_size)) {
-            free(values);
+        if (!MakeRoaringBlobBytes(rb, &blob_bytes, &blob_size)) {
+            roaring_bitmap_free(rb);
             SetFunctionError(info, "out of memory while serializing bm_build output");
             return;
         }
@@ -1324,7 +1527,7 @@ static void BitmapBuildFunction(duckdb_function_info info, duckdb_data_chunk inp
         duckdb_vector_assign_string_element_len(output, row, (const char *)blob_bytes, blob_size);
 
         free(blob_bytes);
-        free(values);
+        roaring_bitmap_free(rb);
     }
 }
 
@@ -1550,6 +1753,27 @@ static void RegisterBinaryBitmapFunction(duckdb_connection connection, const cha
 
     duckdb_logical_type blob_type = duckdb_create_logical_type(DUCKDB_TYPE_BLOB);
     duckdb_scalar_function_add_parameter(function, blob_type);
+    duckdb_scalar_function_add_parameter(function, blob_type);
+    duckdb_scalar_function_set_return_type(function, blob_type);
+    duckdb_destroy_logical_type(&blob_type);
+
+    duckdb_scalar_function_set_function(function, function_ptr);
+
+    if (duckdb_register_scalar_function(connection, function) == DuckDBError) {
+        duckdb_destroy_scalar_function(&function);
+        return;
+    }
+
+    duckdb_destroy_scalar_function(&function);
+}
+
+static void RegisterUnaryBitmapFunction(duckdb_connection connection, const char *name, void (*function_ptr)(duckdb_function_info,
+                                                                                                        duckdb_data_chunk,
+                                                                                                        duckdb_vector)) {
+    duckdb_scalar_function function = duckdb_create_scalar_function();
+    duckdb_scalar_function_set_name(function, name);
+
+    duckdb_logical_type blob_type = duckdb_create_logical_type(DUCKDB_TYPE_BLOB);
     duckdb_scalar_function_add_parameter(function, blob_type);
     duckdb_scalar_function_set_return_type(function, blob_type);
     duckdb_destroy_logical_type(&blob_type);
@@ -1830,6 +2054,7 @@ DUCKDB_EXTENSION_ENTRYPOINT(duckdb_connection connection, duckdb_extension_info 
     RegisterContainsBitmapFunction(connection);
     RegisterBitmapVarcharFunction(connection, "bm_format", BitmapFormatFunction);
     RegisterBitmapVarcharFunction(connection, "bm_stats", BitmapStatsFunction);
+    RegisterUnaryBitmapFunction(connection, "bm_reencode_roaring", BitmapReencodeRoaringFunction);
     RegisterToRowsBitmapFunction(connection);
     RegisterBuildBitmapFunction(connection);
     RegisterBuildAggBitmapFunction(connection);
