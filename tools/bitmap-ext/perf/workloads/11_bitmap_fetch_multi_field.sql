@@ -1,20 +1,14 @@
 WITH context AS (
     SELECT bm_and(
                bm_and(
-                   bm_or(
-                       (SELECT bm FROM li_bitmap_returnflag WHERE value = 'R'),
-                       (SELECT bm FROM li_bitmap_returnflag WHERE value = 'N')
-                   ),
+                   (SELECT bm_or_agg(bm) FROM li_bitmap_returnflag WHERE value IN ('R', 'N')),
                    (SELECT bm FROM li_bitmap_linestatus WHERE value = 'O')
                ),
-               bm_or(
-                   (SELECT bm FROM li_bitmap_shipmode WHERE value = 'AIR'),
-                   (SELECT bm FROM li_bitmap_shipmode WHERE value = 'RAIL')
-               )
+               (SELECT bm_or_agg(bm) FROM li_bitmap_shipmode WHERE value IN ('AIR', 'RAIL'))
            ) AS bm
 ),
 selected_rows AS (
-    SELECT unnest(bm_to_rows((SELECT bm FROM context))) AS rid
+    SELECT unnest(bm_to_rows((SELECT bm FROM context), 10000::UBIGINT, -1::BIGINT)) AS rid
 )
 SELECT
     li.rid,

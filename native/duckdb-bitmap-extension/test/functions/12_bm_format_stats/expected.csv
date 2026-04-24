@@ -1,0 +1,2 @@
+format_name,stats,null_format,null_stats
+sorted_u32_v1,encoding=sorted_u32_v1;cardinality=3;serialized_bytes=24;payload_bytes=12,true,true

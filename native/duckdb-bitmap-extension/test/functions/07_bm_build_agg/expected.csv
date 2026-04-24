@@ -1,0 +1,2 @@
+cardinality,contains_65536,contains_max_u32,rows_csv
+6,true,true,"1,5,9,65535,65536,4294967295"

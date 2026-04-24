@@ -1,5 +1,6 @@
 #include "duckdb_extension.h"
 
+#include <stdio.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -20,6 +21,10 @@ DUCKDB_EXTENSION_EXTERN
 typedef struct BitmapView {
     const uint8_t *payload;
     idx_t count;
+    idx_t payload_size;
+    idx_t total_size;
+    uint8_t version;
+    uint8_t encoding;
 } BitmapView;
 
 typedef enum BitmapBinaryOp {
@@ -87,6 +92,10 @@ static bool ParseBitmapBlobBytes(duckdb_function_info info, const uint8_t *data,
     }
     out->payload = data + BITMAP_HEADER_SIZE;
     out->count = (idx_t)(payload_len / 4U);
+    out->payload_size = (idx_t)payload_len;
+    out->total_size = size;
+    out->version = data[4];
+    out->encoding = data[5];
     return true;
 }
 
@@ -213,7 +222,18 @@ static bool ApplyBinaryOp(const BitmapView *lhs, const BitmapView *rhs, BitmapBi
     if (lhs->count > (idx_t)(SIZE_MAX - rhs->count)) {
         return false;
     }
-    idx_t max_count = lhs->count + rhs->count;
+    idx_t max_count = 0;
+    switch (op) {
+    case BITMAP_OP_OR:
+        max_count = lhs->count + rhs->count;
+        break;
+    case BITMAP_OP_AND:
+        max_count = lhs->count < rhs->count ? lhs->count : rhs->count;
+        break;
+    case BITMAP_OP_ANDNOT:
+        max_count = lhs->count;
+        break;
+    }
     uint32_t *values = NULL;
     if (max_count > 0) {
         if (max_count > (idx_t)(SIZE_MAX / sizeof(uint32_t))) {
@@ -266,6 +286,108 @@ static bool BitmapContainsValue(const BitmapView *view, uint64_t needle) {
     return low < view->count && BitmapViewValueAt(view, low) == target;
 }
 
+static idx_t BitmapLowerBoundGreaterThan(const BitmapView *view, int64_t start_after) {
+    if (start_after < 0) {
+        return 0;
+    }
+    if ((uint64_t)start_after >= UINT32_MAX) {
+        return view->count;
+    }
+
+    uint32_t target = (uint32_t)((uint64_t)start_after + 1U);
+    idx_t low = 0;
+    idx_t high = view->count;
+    while (low < high) {
+        idx_t mid = low + ((high - low) / 2);
+        if (BitmapViewValueAt(view, mid) < target) {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    return low;
+}
+
+static uint64_t CountOr(const BitmapView *lhs, const BitmapView *rhs) {
+    idx_t i = 0;
+    idx_t j = 0;
+    uint64_t count = 0;
+    while (i < lhs->count && j < rhs->count) {
+        uint32_t lhs_value = BitmapViewValueAt(lhs, i);
+        uint32_t rhs_value = BitmapViewValueAt(rhs, j);
+        if (lhs_value < rhs_value) {
+            i++;
+        } else if (rhs_value < lhs_value) {
+            j++;
+        } else {
+            i++;
+            j++;
+        }
+        count++;
+    }
+    count += (uint64_t)(lhs->count - i);
+    count += (uint64_t)(rhs->count - j);
+    return count;
+}
+
+static uint64_t CountAnd(const BitmapView *lhs, const BitmapView *rhs) {
+    idx_t i = 0;
+    idx_t j = 0;
+    uint64_t count = 0;
+    while (i < lhs->count && j < rhs->count) {
+        uint32_t lhs_value = BitmapViewValueAt(lhs, i);
+        uint32_t rhs_value = BitmapViewValueAt(rhs, j);
+        if (lhs_value < rhs_value) {
+            i++;
+        } else if (rhs_value < lhs_value) {
+            j++;
+        } else {
+            count++;
+            i++;
+            j++;
+        }
+    }
+    return count;
+}
+
+static uint64_t CountAndNot(const BitmapView *lhs, const BitmapView *rhs) {
+    idx_t i = 0;
+    idx_t j = 0;
+    uint64_t count = 0;
+    while (i < lhs->count && j < rhs->count) {
+        uint32_t lhs_value = BitmapViewValueAt(lhs, i);
+        uint32_t rhs_value = BitmapViewValueAt(rhs, j);
+        if (lhs_value < rhs_value) {
+            count++;
+            i++;
+        } else if (rhs_value < lhs_value) {
+            j++;
+        } else {
+            i++;
+            j++;
+        }
+    }
+    count += (uint64_t)(lhs->count - i);
+    return count;
+}
+
+static bool BitmapsIntersect(const BitmapView *lhs, const BitmapView *rhs) {
+    idx_t i = 0;
+    idx_t j = 0;
+    while (i < lhs->count && j < rhs->count) {
+        uint32_t lhs_value = BitmapViewValueAt(lhs, i);
+        uint32_t rhs_value = BitmapViewValueAt(rhs, j);
+        if (lhs_value < rhs_value) {
+            i++;
+        } else if (rhs_value < lhs_value) {
+            j++;
+        } else {
+            return true;
+        }
+    }
+    return false;
+}
+
 static int CompareUint32(const void *lhs, const void *rhs) {
     uint32_t a = *(const uint32_t *)lhs;
     uint32_t b = *(const uint32_t *)rhs;
@@ -276,6 +398,185 @@ static int CompareUint32(const void *lhs, const void *rhs) {
         return 1;
     }
     return 0;
+}
+
+typedef struct BitmapAggState {
+    uint32_t *values;
+    idx_t count;
+    idx_t capacity;
+    bool failed;
+} BitmapAggState;
+
+static bool EnsureAggCapacity(BitmapAggState *state, idx_t extra) {
+    if (extra == 0) {
+        return true;
+    }
+    if (state->count > (idx_t)(SIZE_MAX - extra)) {
+        return false;
+    }
+    idx_t required = state->count + extra;
+    if (required <= state->capacity) {
+        return true;
+    }
+
+    idx_t new_capacity = state->capacity == 0 ? 1024 : state->capacity;
+    while (new_capacity < required) {
+        if (new_capacity > (idx_t)(SIZE_MAX / 2)) {
+            new_capacity = required;
+            break;
+        }
+        new_capacity *= 2;
+    }
+    if (new_capacity > (idx_t)(SIZE_MAX / sizeof(uint32_t))) {
+        return false;
+    }
+
+    uint32_t *new_values = (uint32_t *)realloc(state->values, (size_t)new_capacity * sizeof(uint32_t));
+    if (new_values == NULL) {
+        return false;
+    }
+    state->values = new_values;
+    state->capacity = new_capacity;
+    return true;
+}
+
+static bool AppendAggValue(BitmapAggState *state, uint32_t value) {
+    if (!EnsureAggCapacity(state, 1)) {
+        return false;
+    }
+    state->values[state->count++] = value;
+    return true;
+}
+
+static idx_t SortDeduplicateAggState(BitmapAggState *state) {
+    if (state->count > 1) {
+        qsort(state->values, (size_t)state->count, sizeof(uint32_t), CompareUint32);
+    }
+
+    idx_t unique_count = 0;
+    for (idx_t i = 0; i < state->count; i++) {
+        if (i == 0 || state->values[i] != state->values[i - 1]) {
+            state->values[unique_count++] = state->values[i];
+        }
+    }
+    state->count = unique_count;
+    return unique_count;
+}
+
+static bool MergeAggSortedWithBitmapView(BitmapAggState *state, const BitmapView *view) {
+    if (view->count == 0) {
+        return true;
+    }
+    if (state->count == 0) {
+        if (!EnsureAggCapacity(state, view->count)) {
+            return false;
+        }
+        for (idx_t i = 0; i < view->count; i++) {
+            state->values[i] = BitmapViewValueAt(view, i);
+        }
+        state->count = view->count;
+        return true;
+    }
+    if (state->count > (idx_t)(SIZE_MAX - view->count)) {
+        return false;
+    }
+
+    idx_t max_count = state->count + view->count;
+    if (max_count > (idx_t)(SIZE_MAX / sizeof(uint32_t))) {
+        return false;
+    }
+    uint32_t *merged = (uint32_t *)malloc((size_t)max_count * sizeof(uint32_t));
+    if (merged == NULL) {
+        return false;
+    }
+
+    idx_t i = 0;
+    idx_t j = 0;
+    idx_t k = 0;
+    while (i < state->count && j < view->count) {
+        uint32_t lhs_value = state->values[i];
+        uint32_t rhs_value = BitmapViewValueAt(view, j);
+        if (lhs_value < rhs_value) {
+            merged[k++] = lhs_value;
+            i++;
+        } else if (rhs_value < lhs_value) {
+            merged[k++] = rhs_value;
+            j++;
+        } else {
+            merged[k++] = lhs_value;
+            i++;
+            j++;
+        }
+    }
+    while (i < state->count) {
+        merged[k++] = state->values[i++];
+    }
+    while (j < view->count) {
+        merged[k++] = BitmapViewValueAt(view, j++);
+    }
+
+    free(state->values);
+    state->values = merged;
+    state->count = k;
+    state->capacity = max_count;
+    return true;
+}
+
+static bool MergeAggSortedValues(BitmapAggState *target, const uint32_t *values, idx_t value_count) {
+    if (value_count == 0) {
+        return true;
+    }
+    if (target->count == 0) {
+        if (!EnsureAggCapacity(target, value_count)) {
+            return false;
+        }
+        memcpy(target->values, values, (size_t)value_count * sizeof(uint32_t));
+        target->count = value_count;
+        return true;
+    }
+    if (target->count > (idx_t)(SIZE_MAX - value_count)) {
+        return false;
+    }
+
+    idx_t max_count = target->count + value_count;
+    if (max_count > (idx_t)(SIZE_MAX / sizeof(uint32_t))) {
+        return false;
+    }
+    uint32_t *merged = (uint32_t *)malloc((size_t)max_count * sizeof(uint32_t));
+    if (merged == NULL) {
+        return false;
+    }
+
+    idx_t i = 0;
+    idx_t j = 0;
+    idx_t k = 0;
+    while (i < target->count && j < value_count) {
+        uint32_t lhs_value = target->values[i];
+        uint32_t rhs_value = values[j];
+        if (lhs_value < rhs_value) {
+            merged[k++] = lhs_value;
+            i++;
+        } else if (rhs_value < lhs_value) {
+            merged[k++] = rhs_value;
+            j++;
+        } else {
+            merged[k++] = lhs_value;
+            i++;
+            j++;
+        }
+    }
+    while (i < target->count) {
+        merged[k++] = target->values[i++];
+    }
+    while (j < value_count) {
+        merged[k++] = values[j++];
+    }
+
+    free(target->values);
+    target->values = merged;
+    target->count = k;
+    target->capacity = max_count;
+    return true;
 }
 
 static void BitmapHello(duckdb_function_info info, duckdb_data_chunk input, duckdb_vector output) {
@@ -491,6 +792,104 @@ static void BitmapCountFunction(duckdb_function_info info, duckdb_data_chunk inp
     }
 }
 
+static void BitmapCountBinaryCommon(duckdb_function_info info, duckdb_data_chunk input, duckdb_vector output,
+                                    BitmapBinaryOp op) {
+    idx_t row_count = duckdb_data_chunk_get_size(input);
+    duckdb_vector lhs_vector = duckdb_data_chunk_get_vector(input, 0);
+    duckdb_vector rhs_vector = duckdb_data_chunk_get_vector(input, 1);
+    uint64_t *lhs_validity = duckdb_vector_get_validity(lhs_vector);
+    uint64_t *rhs_validity = duckdb_vector_get_validity(rhs_vector);
+    bool has_null = false;
+    for (idx_t row = 0; row < row_count; row++) {
+        if (!RowIsValid(lhs_validity, row) || !RowIsValid(rhs_validity, row)) {
+            has_null = true;
+            break;
+        }
+    }
+    if (has_null) {
+        duckdb_vector_ensure_validity_writable(output);
+    }
+    uint64_t *output_validity = duckdb_vector_get_validity(output);
+    uint64_t *out_data = (uint64_t *)duckdb_vector_get_data(output);
+
+    for (idx_t row = 0; row < row_count; row++) {
+        if (!RowIsValid(lhs_validity, row) || !RowIsValid(rhs_validity, row)) {
+            duckdb_validity_set_row_invalid(output_validity, row);
+            continue;
+        }
+
+        BitmapView lhs = {0};
+        BitmapView rhs = {0};
+        if (!ParseBitmapBlob(info, lhs_vector, row, &lhs)) {
+            return;
+        }
+        if (!ParseBitmapBlob(info, rhs_vector, row, &rhs)) {
+            return;
+        }
+
+        switch (op) {
+        case BITMAP_OP_OR:
+            out_data[row] = CountOr(&lhs, &rhs);
+            break;
+        case BITMAP_OP_AND:
+            out_data[row] = CountAnd(&lhs, &rhs);
+            break;
+        case BITMAP_OP_ANDNOT:
+            out_data[row] = CountAndNot(&lhs, &rhs);
+            break;
+        }
+    }
+}
+
+static void BitmapCountOrFunction(duckdb_function_info info, duckdb_data_chunk input, duckdb_vector output) {
+    BitmapCountBinaryCommon(info, input, output, BITMAP_OP_OR);
+}
+
+static void BitmapCountAndFunction(duckdb_function_info info, duckdb_data_chunk input, duckdb_vector output) {
+    BitmapCountBinaryCommon(info, input, output, BITMAP_OP_AND);
+}
+
+static void BitmapCountAndNotFunction(duckdb_function_info info, duckdb_data_chunk input, duckdb_vector output) {
+    BitmapCountBinaryCommon(info, input, output, BITMAP_OP_ANDNOT);
+}
+
+static void BitmapIntersectsFunction(duckdb_function_info info, duckdb_data_chunk input, duckdb_vector output) {
+    idx_t row_count = duckdb_data_chunk_get_size(input);
+    duckdb_vector lhs_vector = duckdb_data_chunk_get_vector(input, 0);
+    duckdb_vector rhs_vector = duckdb_data_chunk_get_vector(input, 1);
+    uint64_t *lhs_validity = duckdb_vector_get_validity(lhs_vector);
+    uint64_t *rhs_validity = duckdb_vector_get_validity(rhs_vector);
+    bool has_null = false;
+    for (idx_t row = 0; row < row_count; row++) {
+        if (!RowIsValid(lhs_validity, row) || !RowIsValid(rhs_validity, row)) {
+            has_null = true;
+            break;
+        }
+    }
+    if (has_null) {
+        duckdb_vector_ensure_validity_writable(output);
+    }
+    uint64_t *output_validity = duckdb_vector_get_validity(output);
+    bool *out_data = (bool *)duckdb_vector_get_data(output);
+
+    for (idx_t row = 0; row < row_count; row++) {
+        if (!RowIsValid(lhs_validity, row) || !RowIsValid(rhs_validity, row)) {
+            duckdb_validity_set_row_invalid(output_validity, row);
+            continue;
+        }
+
+        BitmapView lhs = {0};
+        BitmapView rhs = {0};
+        if (!ParseBitmapBlob(info, lhs_vector, row, &lhs)) {
+            return;
+        }
+        if (!ParseBitmapBlob(info, rhs_vector, row, &rhs)) {
+            return;
+        }
+        out_data[row] = BitmapsIntersect(&lhs, &rhs);
+    }
+}
+
 static void BitmapContainsFunction(duckdb_function_info info, duckdb_data_chunk input, duckdb_vector output) {
     idx_t row_count = duckdb_data_chunk_get_size(input);
     duckdb_vector bitmap_vector = duckdb_data_chunk_get_vector(input, 0);
@@ -522,6 +921,83 @@ static void BitmapContainsFunction(duckdb_function_info info, duckdb_data_chunk 
             return;
         }
         out_data[row] = BitmapContainsValue(&bitmap, rowid_data[row]);
+    }
+}
+
+static const char *BitmapFormatName(const BitmapView *bitmap) {
+    if (bitmap->version == BITMAP_FORMAT_VERSION && bitmap->encoding == BITMAP_ENCODING_SORTED_U32) {
+        return "sorted_u32_v1";
+    }
+    return "unknown";
+}
+
+static void BitmapFormatFunction(duckdb_function_info info, duckdb_data_chunk input, duckdb_vector output) {
+    idx_t row_count = duckdb_data_chunk_get_size(input);
+    duckdb_vector bitmap_vector = duckdb_data_chunk_get_vector(input, 0);
+    uint64_t *input_validity = duckdb_vector_get_validity(bitmap_vector);
+    bool has_null = false;
+    for (idx_t row = 0; row < row_count; row++) {
+        if (!RowIsValid(input_validity, row)) {
+            has_null = true;
+            break;
+        }
+    }
+    if (has_null) {
+        duckdb_vector_ensure_validity_writable(output);
+    }
+    uint64_t *output_validity = duckdb_vector_get_validity(output);
+
+    for (idx_t row = 0; row < row_count; row++) {
+        if (!RowIsValid(input_validity, row)) {
+            duckdb_validity_set_row_invalid(output_validity, row);
+            continue;
+        }
+
+        BitmapView bitmap = {0};
+        if (!ParseBitmapBlob(info, bitmap_vector, row, &bitmap)) {
+            return;
+        }
+        duckdb_vector_assign_string_element(output, row, BitmapFormatName(&bitmap));
+    }
+}
+
+static void BitmapStatsFunction(duckdb_function_info info, duckdb_data_chunk input, duckdb_vector output) {
+    idx_t row_count = duckdb_data_chunk_get_size(input);
+    duckdb_vector bitmap_vector = duckdb_data_chunk_get_vector(input, 0);
+    uint64_t *input_validity = duckdb_vector_get_validity(bitmap_vector);
+    bool has_null = false;
+    for (idx_t row = 0; row < row_count; row++) {
+        if (!RowIsValid(input_validity, row)) {
+            has_null = true;
+            break;
+        }
+    }
+    if (has_null) {
+        duckdb_vector_ensure_validity_writable(output);
+    }
+    uint64_t *output_validity = duckdb_vector_get_validity(output);
+
+    for (idx_t row = 0; row < row_count; row++) {
+        if (!RowIsValid(input_validity, row)) {
+            duckdb_validity_set_row_invalid(output_validity, row);
+            continue;
+        }
+
+        BitmapView bitmap = {0};
+        if (!ParseBitmapBlob(info, bitmap_vector, row, &bitmap)) {
+            return;
+        }
+
+        char stats[160];
+        int written = snprintf(stats, sizeof(stats),
+                               "encoding=%s;cardinality=%llu;serialized_bytes=%llu;payload_bytes=%llu",
+                               BitmapFormatName(&bitmap), (unsigned long long)bitmap.count,
+                               (unsigned long long)bitmap.total_size, (unsigned long long)bitmap.payload_size);
+        if (written < 0 || (size_t)written >= sizeof(stats)) {
+            SetFunctionError(info, "failed to format bitmap stats");
+            return;
+        }
+        duckdb_vector_assign_string_element(output, row, stats);
     }
 }
 
@@ -584,6 +1060,88 @@ static void BitmapToRowsFunction(duckdb_function_info info, duckdb_data_chunk in
             child_data[child_offset + i] = (uint64_t)BitmapViewValueAt(&bitmap, i);
         }
         child_offset += bitmap.count;
+    }
+}
+
+static void BitmapToRowsLimitedFunction(duckdb_function_info info, duckdb_data_chunk input, duckdb_vector output) {
+    idx_t row_count = duckdb_data_chunk_get_size(input);
+    duckdb_vector bitmap_vector = duckdb_data_chunk_get_vector(input, 0);
+    duckdb_vector limit_vector = duckdb_data_chunk_get_vector(input, 1);
+    duckdb_vector start_after_vector = duckdb_data_chunk_get_vector(input, 2);
+    uint64_t *bitmap_validity = duckdb_vector_get_validity(bitmap_vector);
+    uint64_t *limit_validity = duckdb_vector_get_validity(limit_vector);
+    uint64_t *start_after_validity = duckdb_vector_get_validity(start_after_vector);
+    uint64_t *limit_data = (uint64_t *)duckdb_vector_get_data(limit_vector);
+    int64_t *start_after_data = (int64_t *)duckdb_vector_get_data(start_after_vector);
+
+    bool has_null = false;
+    idx_t total_rows = 0;
+    for (idx_t row = 0; row < row_count; row++) {
+        if (!RowIsValid(bitmap_validity, row) || !RowIsValid(limit_validity, row) ||
+            !RowIsValid(start_after_validity, row)) {
+            has_null = true;
+            continue;
+        }
+
+        BitmapView bitmap = {0};
+        if (!ParseBitmapBlob(info, bitmap_vector, row, &bitmap)) {
+            return;
+        }
+
+        idx_t start = BitmapLowerBoundGreaterThan(&bitmap, start_after_data[row]);
+        idx_t remaining = bitmap.count - start;
+        idx_t limit = limit_data[row] > (uint64_t)SIZE_MAX ? (idx_t)SIZE_MAX : (idx_t)limit_data[row];
+        idx_t emit_count = remaining < limit ? remaining : limit;
+        if (total_rows > (idx_t)(SIZE_MAX - emit_count)) {
+            SetFunctionError(info, "bitmap row output exceeds supported size");
+            return;
+        }
+        total_rows += emit_count;
+    }
+
+    if (has_null) {
+        duckdb_vector_ensure_validity_writable(output);
+    }
+    if (duckdb_list_vector_reserve(output, total_rows) == DuckDBError) {
+        SetFunctionError(info, "out of memory while reserving limited bitmap row output");
+        return;
+    }
+    if (duckdb_list_vector_set_size(output, total_rows) == DuckDBError) {
+        SetFunctionError(info, "failed to size limited bitmap row output");
+        return;
+    }
+
+    uint64_t *output_validity = duckdb_vector_get_validity(output);
+    duckdb_list_entry *out_entries = (duckdb_list_entry *)duckdb_vector_get_data(output);
+    duckdb_vector child_vector = duckdb_list_vector_get_child(output);
+    uint64_t *child_data = (uint64_t *)duckdb_vector_get_data(child_vector);
+
+    idx_t child_offset = 0;
+    for (idx_t row = 0; row < row_count; row++) {
+        if (!RowIsValid(bitmap_validity, row) || !RowIsValid(limit_validity, row) ||
+            !RowIsValid(start_after_validity, row)) {
+            duckdb_validity_set_row_invalid(output_validity, row);
+            out_entries[row].offset = 0;
+            out_entries[row].length = 0;
+            continue;
+        }
+
+        BitmapView bitmap = {0};
+        if (!ParseBitmapBlob(info, bitmap_vector, row, &bitmap)) {
+            return;
+        }
+
+        idx_t start = BitmapLowerBoundGreaterThan(&bitmap, start_after_data[row]);
+        idx_t remaining = bitmap.count - start;
+        idx_t limit = limit_data[row] > (uint64_t)SIZE_MAX ? (idx_t)SIZE_MAX : (idx_t)limit_data[row];
+        idx_t emit_count = remaining < limit ? remaining : limit;
+
+        out_entries[row].offset = (uint64_t)child_offset;
+        out_entries[row].length = (uint64_t)emit_count;
+        for (idx_t i = 0; i < emit_count; i++) {
+            child_data[child_offset + i] = (uint64_t)BitmapViewValueAt(&bitmap, start + i);
+        }
+        child_offset += emit_count;
     }
 }
 
@@ -679,6 +1237,173 @@ static void BitmapBuildFunction(duckdb_function_info info, duckdb_data_chunk inp
     }
 }
 
+static idx_t BitmapAggStateSize(duckdb_function_info info) {
+    (void)info;
+    return sizeof(BitmapAggState);
+}
+
+static void BitmapAggInit(duckdb_function_info info, duckdb_aggregate_state state) {
+    (void)info;
+    BitmapAggState *agg = (BitmapAggState *)state;
+    agg->values = NULL;
+    agg->count = 0;
+    agg->capacity = 0;
+    agg->failed = false;
+}
+
+static void BitmapAggDestroy(duckdb_aggregate_state *states, idx_t count) {
+    for (idx_t i = 0; i < count; i++) {
+        BitmapAggState *state = (BitmapAggState *)states[i];
+        if (state == NULL) {
+            continue;
+        }
+        free(state->values);
+        state->values = NULL;
+        state->count = 0;
+        state->capacity = 0;
+    }
+}
+
+static void BitmapBuildAggUpdate(duckdb_function_info info, duckdb_data_chunk input, duckdb_aggregate_state *states) {
+    idx_t row_count = duckdb_data_chunk_get_size(input);
+    duckdb_vector rowid_vector = duckdb_data_chunk_get_vector(input, 0);
+    uint64_t *rowid_validity = duckdb_vector_get_validity(rowid_vector);
+    uint64_t *rowid_data = (uint64_t *)duckdb_vector_get_data(rowid_vector);
+
+    for (idx_t row = 0; row < row_count; row++) {
+        if (!RowIsValid(rowid_validity, row)) {
+            continue;
+        }
+
+        uint64_t row_id = rowid_data[row];
+        if (row_id > UINT32_MAX) {
+            BitmapAggState *state = (BitmapAggState *)states[row];
+            state->failed = true;
+            duckdb_aggregate_function_set_error(info, "bm_build_agg row id exceeds UINT32 range");
+            return;
+        }
+
+        BitmapAggState *state = (BitmapAggState *)states[row];
+        if (!AppendAggValue(state, (uint32_t)row_id)) {
+            state->failed = true;
+            duckdb_aggregate_function_set_error(info, "out of memory while updating bm_build_agg");
+            return;
+        }
+    }
+}
+
+static void BitmapOrAggUpdate(duckdb_function_info info, duckdb_data_chunk input, duckdb_aggregate_state *states) {
+    idx_t row_count = duckdb_data_chunk_get_size(input);
+    duckdb_vector bitmap_vector = duckdb_data_chunk_get_vector(input, 0);
+    uint64_t *bitmap_validity = duckdb_vector_get_validity(bitmap_vector);
+
+    for (idx_t row = 0; row < row_count; row++) {
+        if (!RowIsValid(bitmap_validity, row)) {
+            continue;
+        }
+
+        BitmapView bitmap = {0};
+        if (!ParseBitmapBlob(info, bitmap_vector, row, &bitmap)) {
+            BitmapAggState *state = (BitmapAggState *)states[row];
+            state->failed = true;
+            return;
+        }
+
+        BitmapAggState *state = (BitmapAggState *)states[row];
+        if (!MergeAggSortedWithBitmapView(state, &bitmap)) {
+            state->failed = true;
+            duckdb_aggregate_function_set_error(info, "out of memory while updating bm_or_agg");
+            return;
+        }
+    }
+}
+
+static void BitmapAggCombine(duckdb_function_info info, duckdb_aggregate_state *source, duckdb_aggregate_state *target,
+                             idx_t count) {
+    for (idx_t i = 0; i < count; i++) {
+        BitmapAggState *source_state = (BitmapAggState *)source[i];
+        BitmapAggState *target_state = (BitmapAggState *)target[i];
+
+        if (source_state->failed || target_state->failed) {
+            target_state->failed = true;
+            duckdb_aggregate_function_set_error(info, "bitmap aggregate state is failed");
+            return;
+        }
+        if (!EnsureAggCapacity(target_state, source_state->count)) {
+            target_state->failed = true;
+            duckdb_aggregate_function_set_error(info, "out of memory while combining bitmap aggregate states");
+            return;
+        }
+        if (source_state->count > 0) {
+            memcpy(target_state->values + target_state->count, source_state->values,
+                   (size_t)source_state->count * sizeof(uint32_t));
+            target_state->count += source_state->count;
+        }
+    }
+}
+
+static void BitmapOrAggCombine(duckdb_function_info info, duckdb_aggregate_state *source, duckdb_aggregate_state *target,
+                               idx_t count) {
+    for (idx_t i = 0; i < count; i++) {
+        BitmapAggState *source_state = (BitmapAggState *)source[i];
+        BitmapAggState *target_state = (BitmapAggState *)target[i];
+
+        if (source_state->failed || target_state->failed) {
+            target_state->failed = true;
+            duckdb_aggregate_function_set_error(info, "bitmap aggregate state is failed");
+            return;
+        }
+        if (!MergeAggSortedValues(target_state, source_state->values, source_state->count)) {
+            target_state->failed = true;
+            duckdb_aggregate_function_set_error(info, "out of memory while combining bm_or_agg states");
+            return;
+        }
+    }
+}
+
+static void BitmapAggFinalize(duckdb_function_info info, duckdb_aggregate_state *source, duckdb_vector result,
+                              idx_t count, idx_t offset) {
+    for (idx_t i = 0; i < count; i++) {
+        BitmapAggState *state = (BitmapAggState *)source[i];
+        if (state->failed) {
+            duckdb_aggregate_function_set_error(info, "bitmap aggregate state is failed");
+            return;
+        }
+
+        idx_t unique_count = SortDeduplicateAggState(state);
+        uint8_t *blob_bytes = NULL;
+        idx_t blob_size = 0;
+        if (!MakeBitmapBlobBytes(state->values, unique_count, &blob_bytes, &blob_size)) {
+            duckdb_aggregate_function_set_error(info, "out of memory while finalizing bitmap aggregate");
+            return;
+        }
+
+        duckdb_vector_assign_string_element_len(result, offset + i, (const char *)blob_bytes, blob_size);
+        free(blob_bytes);
+    }
+}
+
+static void BitmapSortedAggFinalize(duckdb_function_info info, duckdb_aggregate_state *source, duckdb_vector result,
+                                    idx_t count, idx_t offset) {
+    for (idx_t i = 0; i < count; i++) {
+        BitmapAggState *state = (BitmapAggState *)source[i];
+        if (state->failed) {
+            duckdb_aggregate_function_set_error(info, "bitmap aggregate state is failed");
+            return;
+        }
+
+        uint8_t *blob_bytes = NULL;
+        idx_t blob_size = 0;
+        if (!MakeBitmapBlobBytes(state->values, state->count, &blob_bytes, &blob_size)) {
+            duckdb_aggregate_function_set_error(info, "out of memory while finalizing bitmap aggregate");
+            return;
+        }
+
+        duckdb_vector_assign_string_element_len(result, offset + i, (const char *)blob_bytes, blob_size);
+        free(blob_bytes);
+    }
+}
+
 static void RegisterBitmapHello(duckdb_connection connection) {
     duckdb_scalar_function function = duckdb_create_scalar_function();
     duckdb_scalar_function_set_name(function, "bitmap_hello");
@@ -742,6 +1467,54 @@ static void RegisterCountBitmapFunction(duckdb_connection connection) {
     duckdb_destroy_scalar_function(&function);
 }
 
+static void RegisterBinaryCountBitmapFunction(duckdb_connection connection, const char *name,
+                                              void (*function_ptr)(duckdb_function_info, duckdb_data_chunk,
+                                                                   duckdb_vector)) {
+    duckdb_scalar_function function = duckdb_create_scalar_function();
+    duckdb_scalar_function_set_name(function, name);
+
+    duckdb_logical_type blob_type = duckdb_create_logical_type(DUCKDB_TYPE_BLOB);
+    duckdb_scalar_function_add_parameter(function, blob_type);
+    duckdb_scalar_function_add_parameter(function, blob_type);
+    duckdb_destroy_logical_type(&blob_type);
+
+    duckdb_logical_type ubigint_type = duckdb_create_logical_type(DUCKDB_TYPE_UBIGINT);
+    duckdb_scalar_function_set_return_type(function, ubigint_type);
+    duckdb_destroy_logical_type(&ubigint_type);
+
+    duckdb_scalar_function_set_function(function, function_ptr);
+
+    if (duckdb_register_scalar_function(connection, function) == DuckDBError) {
+        duckdb_destroy_scalar_function(&function);
+        return;
+    }
+
+    duckdb_destroy_scalar_function(&function);
+}
+
+static void RegisterIntersectsBitmapFunction(duckdb_connection connection) {
+    duckdb_scalar_function function = duckdb_create_scalar_function();
+    duckdb_scalar_function_set_name(function, "bm_intersects");
+
+    duckdb_logical_type blob_type = duckdb_create_logical_type(DUCKDB_TYPE_BLOB);
+    duckdb_scalar_function_add_parameter(function, blob_type);
+    duckdb_scalar_function_add_parameter(function, blob_type);
+    duckdb_destroy_logical_type(&blob_type);
+
+    duckdb_logical_type boolean_type = duckdb_create_logical_type(DUCKDB_TYPE_BOOLEAN);
+    duckdb_scalar_function_set_return_type(function, boolean_type);
+    duckdb_destroy_logical_type(&boolean_type);
+
+    duckdb_scalar_function_set_function(function, BitmapIntersectsFunction);
+
+    if (duckdb_register_scalar_function(connection, function) == DuckDBError) {
+        duckdb_destroy_scalar_function(&function);
+        return;
+    }
+
+    duckdb_destroy_scalar_function(&function);
+}
+
 static void RegisterContainsBitmapFunction(duckdb_connection connection) {
     duckdb_scalar_function function = duckdb_create_scalar_function();
     duckdb_scalar_function_set_name(function, "bm_contains");
@@ -768,21 +1541,21 @@ static void RegisterContainsBitmapFunction(duckdb_connection connection) {
     duckdb_destroy_scalar_function(&function);
 }
 
-static void RegisterToRowsBitmapFunction(duckdb_connection connection) {
+static void RegisterBitmapVarcharFunction(duckdb_connection connection, const char *name,
+                                          void (*function_ptr)(duckdb_function_info, duckdb_data_chunk,
+                                                               duckdb_vector)) {
     duckdb_scalar_function function = duckdb_create_scalar_function();
-    duckdb_scalar_function_set_name(function, "bm_to_rows");
+    duckdb_scalar_function_set_name(function, name);
 
     duckdb_logical_type blob_type = duckdb_create_logical_type(DUCKDB_TYPE_BLOB);
     duckdb_scalar_function_add_parameter(function, blob_type);
     duckdb_destroy_logical_type(&blob_type);
 
-    duckdb_logical_type ubigint_type = duckdb_create_logical_type(DUCKDB_TYPE_UBIGINT);
-    duckdb_logical_type list_type = duckdb_create_list_type(ubigint_type);
-    duckdb_scalar_function_set_return_type(function, list_type);
-    duckdb_destroy_logical_type(&list_type);
-    duckdb_destroy_logical_type(&ubigint_type);
+    duckdb_logical_type varchar_type = duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR);
+    duckdb_scalar_function_set_return_type(function, varchar_type);
+    duckdb_destroy_logical_type(&varchar_type);
 
-    duckdb_scalar_function_set_function(function, BitmapToRowsFunction);
+    duckdb_scalar_function_set_function(function, function_ptr);
 
     if (duckdb_register_scalar_function(connection, function) == DuckDBError) {
         duckdb_destroy_scalar_function(&function);
@@ -790,6 +1563,66 @@ static void RegisterToRowsBitmapFunction(duckdb_connection connection) {
     }
 
     duckdb_destroy_scalar_function(&function);
+}
+
+static void RegisterToRowsBitmapFunction(duckdb_connection connection) {
+    duckdb_scalar_function_set set = duckdb_create_scalar_function_set("bm_to_rows");
+
+    duckdb_scalar_function full_function = duckdb_create_scalar_function();
+    duckdb_scalar_function_set_name(full_function, "bm_to_rows");
+    duckdb_logical_type blob_type = duckdb_create_logical_type(DUCKDB_TYPE_BLOB);
+    duckdb_scalar_function_add_parameter(full_function, blob_type);
+    duckdb_destroy_logical_type(&blob_type);
+
+    duckdb_logical_type ubigint_type = duckdb_create_logical_type(DUCKDB_TYPE_UBIGINT);
+    duckdb_logical_type list_type = duckdb_create_list_type(ubigint_type);
+    duckdb_scalar_function_set_return_type(full_function, list_type);
+    duckdb_destroy_logical_type(&list_type);
+    duckdb_destroy_logical_type(&ubigint_type);
+
+    duckdb_scalar_function_set_function(full_function, BitmapToRowsFunction);
+    if (duckdb_add_scalar_function_to_set(set, full_function) == DuckDBError) {
+        duckdb_destroy_scalar_function(&full_function);
+        duckdb_destroy_scalar_function_set(&set);
+        return;
+    }
+
+    duckdb_scalar_function limited_function = duckdb_create_scalar_function();
+    duckdb_scalar_function_set_name(limited_function, "bm_to_rows");
+    blob_type = duckdb_create_logical_type(DUCKDB_TYPE_BLOB);
+    duckdb_scalar_function_add_parameter(limited_function, blob_type);
+    duckdb_destroy_logical_type(&blob_type);
+
+    ubigint_type = duckdb_create_logical_type(DUCKDB_TYPE_UBIGINT);
+    duckdb_scalar_function_add_parameter(limited_function, ubigint_type);
+
+    duckdb_logical_type bigint_type = duckdb_create_logical_type(DUCKDB_TYPE_BIGINT);
+    duckdb_scalar_function_add_parameter(limited_function, bigint_type);
+    duckdb_destroy_logical_type(&bigint_type);
+
+    list_type = duckdb_create_list_type(ubigint_type);
+    duckdb_scalar_function_set_return_type(limited_function, list_type);
+    duckdb_destroy_logical_type(&list_type);
+    duckdb_destroy_logical_type(&ubigint_type);
+
+    duckdb_scalar_function_set_function(limited_function, BitmapToRowsLimitedFunction);
+    if (duckdb_add_scalar_function_to_set(set, limited_function) == DuckDBError) {
+        duckdb_destroy_scalar_function(&full_function);
+        duckdb_destroy_scalar_function(&limited_function);
+        duckdb_destroy_scalar_function_set(&set);
+        return;
+    }
+
+    if (duckdb_register_scalar_function_set(connection, set) == DuckDBError) {
+        duckdb_destroy_scalar_function(&full_function);
+        duckdb_destroy_scalar_function(&limited_function);
+        duckdb_destroy_scalar_function_set(&set);
+        return;
+    }
+
+    duckdb_destroy_scalar_function(&full_function);
+    duckdb_destroy_scalar_function(&limited_function);
+    duckdb_destroy_scalar_function_set(&set);
 }
 
 static void RegisterBuildBitmapFunction(duckdb_connection connection) {
@@ -816,6 +1649,53 @@ static void RegisterBuildBitmapFunction(duckdb_connection connection) {
     duckdb_destroy_scalar_function(&function);
 }
 
+static void RegisterBuildAggBitmapFunction(duckdb_connection connection) {
+    duckdb_aggregate_function function = duckdb_create_aggregate_function();
+    duckdb_aggregate_function_set_name(function, "bm_build_agg");
+
+    duckdb_logical_type ubigint_type = duckdb_create_logical_type(DUCKDB_TYPE_UBIGINT);
+    duckdb_aggregate_function_add_parameter(function, ubigint_type);
+    duckdb_destroy_logical_type(&ubigint_type);
+
+    duckdb_logical_type blob_type = duckdb_create_logical_type(DUCKDB_TYPE_BLOB);
+    duckdb_aggregate_function_set_return_type(function, blob_type);
+    duckdb_destroy_logical_type(&blob_type);
+
+    duckdb_aggregate_function_set_functions(function, BitmapAggStateSize, BitmapAggInit, BitmapBuildAggUpdate,
+                                            BitmapAggCombine, BitmapAggFinalize);
+    duckdb_aggregate_function_set_destructor(function, BitmapAggDestroy);
+    duckdb_aggregate_function_set_special_handling(function);
+
+    if (duckdb_register_aggregate_function(connection, function) == DuckDBError) {
+        duckdb_destroy_aggregate_function(&function);
+        return;
+    }
+
+    duckdb_destroy_aggregate_function(&function);
+}
+
+static void RegisterOrAggBitmapFunction(duckdb_connection connection) {
+    duckdb_aggregate_function function = duckdb_create_aggregate_function();
+    duckdb_aggregate_function_set_name(function, "bm_or_agg");
+
+    duckdb_logical_type blob_type = duckdb_create_logical_type(DUCKDB_TYPE_BLOB);
+    duckdb_aggregate_function_add_parameter(function, blob_type);
+    duckdb_aggregate_function_set_return_type(function, blob_type);
+    duckdb_destroy_logical_type(&blob_type);
+
+    duckdb_aggregate_function_set_functions(function, BitmapAggStateSize, BitmapAggInit, BitmapOrAggUpdate,
+                                            BitmapOrAggCombine, BitmapSortedAggFinalize);
+    duckdb_aggregate_function_set_destructor(function, BitmapAggDestroy);
+    duckdb_aggregate_function_set_special_handling(function);
+
+    if (duckdb_register_aggregate_function(connection, function) == DuckDBError) {
+        duckdb_destroy_aggregate_function(&function);
+        return;
+    }
+
+    duckdb_destroy_aggregate_function(&function);
+}
+
 DUCKDB_EXTENSION_ENTRYPOINT(duckdb_connection connection, duckdb_extension_info info, struct duckdb_extension_access *access) {
     (void)info;
     (void)access;
@@ -824,8 +1704,16 @@ DUCKDB_EXTENSION_ENTRYPOINT(duckdb_connection connection, duckdb_extension_info 
     RegisterBinaryBitmapFunction(connection, "bm_and", BitmapAndFunction);
     RegisterBinaryBitmapFunction(connection, "bm_andnot", BitmapAndNotFunction);
     RegisterCountBitmapFunction(connection);
+    RegisterBinaryCountBitmapFunction(connection, "bm_count_or", BitmapCountOrFunction);
+    RegisterBinaryCountBitmapFunction(connection, "bm_count_and", BitmapCountAndFunction);
+    RegisterBinaryCountBitmapFunction(connection, "bm_count_andnot", BitmapCountAndNotFunction);
+    RegisterIntersectsBitmapFunction(connection);
     RegisterContainsBitmapFunction(connection);
+    RegisterBitmapVarcharFunction(connection, "bm_format", BitmapFormatFunction);
+    RegisterBitmapVarcharFunction(connection, "bm_stats", BitmapStatsFunction);
     RegisterToRowsBitmapFunction(connection);
     RegisterBuildBitmapFunction(connection);
+    RegisterBuildAggBitmapFunction(connection);
+    RegisterOrAggBitmapFunction(connection);
     return true;
 }

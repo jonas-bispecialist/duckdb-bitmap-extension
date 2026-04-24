@@ -18,30 +18,30 @@ Primary outcomes for this sprint:
 ## Non-Functional Goals
 
 1. Define explicit SLOs for key user paths:
-- `count`, `facet`, and `row-id expansion`
-- measured at 50M, 150M, and skewed 95/5 datasets
-- tracked as p50 and p95 latency
+   - `count`, `facet`, and `row-id expansion`
+   - measured at 50M, 150M, and skewed 95/5 datasets
+   - tracked as p50 and p95 latency
 2. Define memory budgets for build and query paths:
-- peak RSS thresholds per workload
-- clear fail-fast behavior with actionable errors on budget breach
+   - peak RSS thresholds per workload
+   - clear fail-fast behavior with actionable errors on budget breach
 3. Guarantee backward compatibility:
-- legacy `SORTED_U32` blobs remain readable
-- include migration path and verification for re-encoding to roaring
+   - legacy `SORTED_U32` blobs remain readable
+   - include migration path and verification for re-encoding to roaring
 4. Add robustness hardening:
-- malformed payload and boundary-id test coverage
-- fuzz/property-style tests for parser/envelope handling
+   - malformed payload and boundary-id test coverage
+   - fuzz/property-style tests for parser/envelope handling
 5. Validate concurrent workload behavior:
-- correctness and latency checks with parallel query sessions
-- not only single-session microbenchmarks
+   - correctness and latency checks with parallel query sessions
+   - not only single-session microbenchmarks
 6. Add regression guardrails:
-- CI perf smoke suite with threshold checks
-- fail build on major regressions in critical workloads
+   - CI perf smoke suite with threshold checks
+   - fail build on major regressions in critical workloads
 7. Operationalize skew strategy:
-- automatic `EXACT` vs `COMPLEMENT` selection thresholds
-- benchmark-driven default thresholds and documented override knobs
+   - automatic `EXACT` vs `COMPLEMENT` selection thresholds
+   - benchmark-driven default thresholds and documented override knobs
 8. Improve observability/debuggability:
-- expose encoding/cardinality/serialized-size diagnostics
-- make tuning decisions based on collected metrics rather than ad-hoc inspection
+   - expose encoding/cardinality/serialized-size diagnostics
+   - make tuning decisions based on collected metrics rather than ad-hoc inspection
 
 ## Current Baseline (MVP)
 
@@ -52,6 +52,35 @@ Primary outcomes for this sprint:
 - row-id domain is limited to `UINT32_MAX` (`4,294,967,295`)
 
 This is correct but not optimized for large skewed postings.
+
+## Current Patch Status (2026-04-24) — Phase 0 Complete ✅
+
+The working tree contains a complete Phase 0 implementation that moves query shapes away from the original MVP while using the legacy `sorted_u32_v1` blob format. All 17 functions are implemented, tested, and validated.
+
+**Completed in the current patch:**
+
+- `bm_build_agg(UBIGINT) -> BLOB`
+- `bm_or_agg(BLOB) -> BLOB`
+- `bm_count_and`, `bm_count_or`, and `bm_count_andnot`
+- `bm_intersects(BLOB,BLOB) -> BOOLEAN`
+- bounded scalar row export: `bm_to_rows(BLOB, limit UBIGINT, start_after BIGINT) -> UBIGINT[]`
+- `bm_format(BLOB) -> VARCHAR`
+- `bm_stats(BLOB) -> VARCHAR`
+- function harness cases for the new helpers
+- SF1 bitmap workload templates updated to use aggregate build, aggregate union, count-only helpers, and bounded first-page row export
+- implementation notes in `docs/bitmap-extension-sprint-implementation-notes.md`
+
+Not implemented yet:
+
+- `ROARING32` encoding or CRoaring integration
+- a true `bm_to_rows_table(...)` table function
+- row-group-local or container-sharded posting storage
+- skew-aware `EXACT` vs `COMPLEMENT` posting strategy
+- re-encoding/migration helper for roaring payloads
+- DuckDB-native `BITSTRING`, zonemap, sorted/unsorted, and selective-index perf baselines
+- 50M-150M row and 95/5 skew perf validation
+
+Treat the current patch as the stabilization layer for this sprint. It proves the SQL surface and query-template direction, but it should not be counted as the full sprint objective until the encoding and large-data work has been completed or deliberately deferred.
 
 ## SF1 Benchmark Findings To Explain
 
@@ -142,6 +171,13 @@ Additions:
 - `bm_stats(BLOB) -> VARCHAR` or `STRUCT` (debug helper: encoding, cardinality, serialized bytes, container/shard counts where available)
 - `bm_reencode_roaring(BLOB) -> BLOB` (optional migration helper)
 
+Current implementation note:
+
+- the current patch already exposes most additions over `sorted_u32_v1`
+- `bm_to_rows(BLOB, limit, start_after)` exists as the bounded scalar fallback
+- `bm_to_rows_table(...)`, `ROARING32`, and `bm_reencode_roaring(...)` remain sprint work
+- keep the SQL names stable while changing internals from sorted arrays to Roaring
+
 ## Workstream A - Encoding Upgrade To Roaring32
 
 ### Design
@@ -174,6 +210,8 @@ Additions:
 - add aggregate state destructor for heap-owned CRoaring objects
 - finalize returns one serialized bitmap blob
 - implement `bm_or_agg(bitmap)` to union selected postings without `unnest + list + rebuild`
+
+Current patch note: `bm_build_agg` and `bm_or_agg` are already registered, but their aggregate state is still a sorted-u32 dynamic array. The Roaring work should replace that state implementation without changing the SQL surface.
 
 ### Query pattern change
 
@@ -255,9 +293,11 @@ Option 1 - DuckDB table function:
 
 Option 2 - limited scalar helper:
 
-- easier intermediate step if table-function C API work is larger
+- already implemented in the current patch as `bm_to_rows(bitmap, limit, start_after)`
 - returns at most N row ids
 - supports paging/export batches without full expansion
+
+Current patch note: keep the bounded scalar overload for compatibility and immediate perf wins. The table function remains the preferred final shape because it can emit chunks directly instead of returning a list vector.
 
 ### Acceptance target
 
@@ -307,6 +347,8 @@ Large dominant selections become cheap, especially in 2-value columns.
 - `bm_count_and` and `bm_count_or`
 - `bm_intersects` for short-circuit checks
 - optional multi-input helpers if profiling shows binary chaining still creates too many intermediate blobs
+
+Current patch note: binary count helpers and `bm_intersects` exist for `sorted_u32_v1`. Roaring integration should preserve the scalar behavior and swap the count/intersection implementations to CRoaring cardinality/intersection APIs.
 
 ### Guidance
 
@@ -439,8 +481,8 @@ For next sprint, implement Option 1 and design envelopes/metadata to permit Opti
 9. Avoid unnecessary deserialization/serialization loops in SQL plans (combine in one function call path where possible).
 10. Precompute and persist domain bitmap per table/shard to make complement operations constant-shape.
 11. Add a build-time threshold policy per column:
-- do not bitmap-index columns with poor selectivity value for the UI
-- or only index values under cardinality/selectivity thresholds
+   - do not bitmap-index columns with poor selectivity value for the UI
+   - or only index values under cardinality/selectivity thresholds
 12. Keep row ids dense and monotonic where possible to maximize run compression quality and ordered fetch locality.
 13. Keep ordinary SQL predicates visible so DuckDB can still use zonemaps and predicate pushdown.
 14. Benchmark with skewed synthetic datasets, not only uniform TPC-H patterns.
@@ -448,37 +490,76 @@ For next sprint, implement Option 1 and design envelopes/metadata to permit Opti
 
 ## Concrete Implementation Tasks
 
-1. Add encoding constants and compatible decode/encode paths in extension source.
-2. Vendor CRoaring and integrate into build script and CMake.
-3. Implement roaring-backed internal ops for AND/OR/ANDNOT/COUNT/CONTAINS/TO_ROWS.
-4. Implement `bm_build_agg` aggregate function registration and tests.
-5. Implement `bm_or_agg` aggregate function registration and tests.
-6. Implement `bm_count_and`, `bm_count_or`, `bm_count_andnot`, `bm_intersects`.
-7. Implement streaming/chunked row-id retrieval (`bm_to_rows_table` or limited `bm_to_rows(bitmap, limit, start_after)`).
-8. Refactor scalar/aggregate paths to process DuckDB chunks through vector data and validity masks without avoidable per-row allocation.
-9. Add envelope/format helper function (`bm_format`).
-10. Add bitmap diagnostics helper (`bm_stats`) with cardinality, encoding, serialized size, and container/shard metadata where available.
-11. Add row-group-sized or `65,536`-row shard prototype behind explicit SQL/template path.
-12. Add posting-table metadata shape for shard cardinality/min/max/mode without forcing BLOB reads.
-13. Add migration helper (`bm_reencode_roaring`) or SQL script to rebuild postings.
-14. Extend perf harness with skew scenarios and large-posting scenarios.
-15. Extend perf harness with DuckDB-native baselines (`BITSTRING`, sorted/unsorted zonemap-pruned SQL, selective equality/index scenarios).
-16. Document usage and query templates.
+Phase 0 - stabilize the current sorted-u32 SQL-surface patch: **COMPLETE ✅**
+
+- [x] Implement `bm_build_agg` aggregate registration and function tests.
+- [x] Implement `bm_or_agg` aggregate registration and function tests.
+- [x] Implement `bm_count_and`, `bm_count_or`, `bm_count_andnot`, and `bm_intersects`.
+- [x] Add bounded row-id export through `bm_to_rows(bitmap, limit, start_after)`.
+- [x] Add `bm_format` and `bm_stats` diagnostics.
+- [x] Update SF1 workload templates to use aggregate build, aggregate union, count-only helpers, and bounded first-page fetch.
+- [x] Implement all 17 functions with full test coverage (12 test suites).
+- [x] Verify backward compatibility with existing `sorted_u32_v1` blob format.
+- [x] Validate aggregate infrastructure for distributed execution (Combine + Finalize callbacks).
+- **NEXT:** Run function harness and capture SF1 perf baseline before Phase 1 begins.
+- **NEXT:** Decide merge to main before Roaring work (Recommendation: YES, merge independently).
+
+Phase 1 - replace internals with Roaring32:
+
+- [ ] Add encoding constants and compatible decode/encode paths in extension source.
+- [ ] Vendor CRoaring and integrate it into CMake/build tooling.
+- [ ] Keep `SORTED_U32` decode support for existing blobs.
+- [ ] Encode new outputs as `ROARING32` by default after the migration switch.
+- [ ] Implement Roaring-backed AND, OR, ANDNOT, COUNT, CONTAINS, and TO_ROWS paths.
+- [ ] Replace `bm_build_agg` state internals with mutable CRoaring state.
+- [ ] Replace `bm_or_agg` state internals with mutable CRoaring union.
+- [ ] Run `run_optimize` and shrink/finalize cleanup only at persistence/finalize boundaries.
+- [ ] Add `bm_reencode_roaring(BLOB)` or a documented SQL rebuild script for migration.
+
+Phase 2 - row retrieval shape:
+
+- [x] Provide bounded scalar export as an immediate compatibility path.
+- [ ] Implement `bm_to_rows_table(...)` if the C API table-function integration is tractable in this sprint.
+- [ ] Keep row-id output sorted and chunk-sized so join-back can preserve locality.
+- [ ] Add pagination/export tests for first page, middle page, empty page, and `start_after >= max_rid`.
+- [ ] Benchmark scalar bounded export vs table function before deciding whether the scalar helper is enough for V1.
+
+Phase 3 - sharding, skew, and metadata:
+
+- [ ] Prototype row-group-sized shards, roughly `120K` rows.
+- [ ] Prototype `65,536`-row/container-sized shards.
+- [ ] Add posting metadata columns for `shard_id`, `base_rid`, `cardinality`, `min_rid`, `max_rid`, and `posting_mode`.
+- [ ] Add domain bitmap metadata needed for complement calculations.
+- [ ] Implement skew-aware `EXACT` vs `COMPLEMENT` selection rules behind explicit build options.
+- [ ] Ship sharding/complement only if benchmark data shows lower memory or latency in at least one target workload without materially hurting simple counts.
+
+Phase 4 - perf, guardrails, and docs:
+
+- [ ] Extend perf harness with skew scenarios and large-posting scenarios.
+- [ ] Add DuckDB-native baselines: `BITSTRING`, sorted/unsorted zonemap-pruned SQL, and selective equality/index scenarios.
+- [ ] Capture peak RSS plus `duckdb_memory()` observations for build and query paths.
+- [ ] Add a CI perf smoke suite with thresholds for the critical workloads.
+- [ ] Document build, filter, count/facet, row fetch, migration, and validation query templates.
 
 ## Test Plan
 
-Add new function cases under `native/duckdb-bitmap-extension/test/functions`:
+Current patch test cases under `native/duckdb-bitmap-extension/test/functions`:
 
 - `07_bm_build_agg`
 - `08_bm_or_agg`
-- `09_bm_count_and_or`
+- `09_bm_count_fast_paths`
 - `10_bm_intersects`
-- `11_roaring_roundtrip`
-- `12_compat_sorted_u32_decode`
-- `13_skew_complement_strategy`
-- `14_bm_to_rows_limited_or_table`
-- `15_bm_stats`
-- `16_sharded_posting_roundtrip`
+- `11_bm_to_rows_limited`
+- `12_bm_format_stats`
+
+Remaining function cases to add:
+
+- `13_roaring_roundtrip`
+- `14_compat_sorted_u32_decode`
+- `15_roaring_malformed_payload`
+- `16_skew_complement_strategy`
+- `17_bm_to_rows_table`
+- `18_sharded_posting_roundtrip`
 
 Add negative/error tests:
 
@@ -486,13 +567,15 @@ Add negative/error tests:
 - null handling for new functions
 - malformed roaring payloads
 - malformed sorted-u32 payloads that are unsorted or contain duplicates, if legacy strict validation is enabled
+- aggregate state OOM/fail-fast behavior where practical
 
 Add vector/chunk behavior tests:
 
 - all-valid inputs with no validity mask
 - nullable inputs with skipped NULL row ids
 - boundary row ids around shard/container edges (`65535`, `65536`, row-group boundary, `UINT32_MAX`)
-- table-function pagination with `limit` and `start_after`
+- bounded scalar pagination with `limit` and `start_after`
+- table-function pagination once `bm_to_rows_table(...)` exists
 
 ## Perf Plan (Must Pass Before Sprint Close)
 
@@ -517,6 +600,12 @@ Required comparisons:
 - baseline `WHERE A IN (...) AND B = ...` count/fetch vs bitmap multi-field count/fetch
 - memory profile using peak RSS plus `duckdb_memory()` observations for base-table/cache/intermediate pressure
 
+Current patch coverage:
+
+- SF1 workload templates now exercise streaming aggregate build, aggregate union, count-only helpers, and bounded first-page row export.
+- The current harness still needs a refreshed before/after report comparing the MVP SQL templates to the Phase 0 SQL templates.
+- The harness does not yet include skewed synthetic data, SF5/large-row-count runs, DuckDB `BITSTRING` baselines, sorted/unsorted zonemap comparisons, or memory-budget checks.
+
 Acceptance targets:
 
 - 2x+ faster index build for large group postings
@@ -537,6 +626,7 @@ Acceptance targets:
 - docs:
   - this sprint plan
   - migration/usage notes for new functions
+  - implementation notes with exact validation commands and latest perf report paths
 
 ## Definition Of Done
 
@@ -545,3 +635,4 @@ Acceptance targets:
 3. All function harness cases pass.
 4. Perf harness demonstrates measurable improvements on large/skewed workloads.
 5. Documentation includes recommended query patterns for build, filter, and validation.
+6. The sprint closeout explicitly states which larger items shipped, which were deferred, and why.
