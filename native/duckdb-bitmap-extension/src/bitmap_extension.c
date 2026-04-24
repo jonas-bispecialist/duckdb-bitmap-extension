@@ -233,132 +233,7 @@ static bool MakeRoaringBlobBytes(roaring_bitmap_t *rb, uint8_t **out_data, idx_t
     return true;
 }
 
-static bool MergeOr(const BitmapView *lhs, const BitmapView *rhs, uint32_t *out, idx_t *out_count) {
-    idx_t i = 0;
-    idx_t j = 0;
-    idx_t k = 0;
-    while (i < lhs->count && j < rhs->count) {
-        uint32_t lhs_value = BitmapViewValueAt(lhs, i);
-        uint32_t rhs_value = BitmapViewValueAt(rhs, j);
-        if (lhs_value < rhs_value) {
-            out[k++] = lhs_value;
-            i++;
-        } else if (rhs_value < lhs_value) {
-            out[k++] = rhs_value;
-            j++;
-        } else {
-            out[k++] = lhs_value;
-            i++;
-            j++;
-        }
-    }
-    while (i < lhs->count) {
-        out[k++] = BitmapViewValueAt(lhs, i);
-        i++;
-    }
-    while (j < rhs->count) {
-        out[k++] = BitmapViewValueAt(rhs, j);
-        j++;
-    }
-    *out_count = k;
-    return true;
-}
 
-static bool MergeAnd(const BitmapView *lhs, const BitmapView *rhs, uint32_t *out, idx_t *out_count) {
-    idx_t i = 0;
-    idx_t j = 0;
-    idx_t k = 0;
-    while (i < lhs->count && j < rhs->count) {
-        uint32_t lhs_value = BitmapViewValueAt(lhs, i);
-        uint32_t rhs_value = BitmapViewValueAt(rhs, j);
-        if (lhs_value < rhs_value) {
-            i++;
-        } else if (rhs_value < lhs_value) {
-            j++;
-        } else {
-            out[k++] = lhs_value;
-            i++;
-            j++;
-        }
-    }
-    *out_count = k;
-    return true;
-}
-
-static bool MergeAndNot(const BitmapView *lhs, const BitmapView *rhs, uint32_t *out, idx_t *out_count) {
-    idx_t i = 0;
-    idx_t j = 0;
-    idx_t k = 0;
-    while (i < lhs->count && j < rhs->count) {
-        uint32_t lhs_value = BitmapViewValueAt(lhs, i);
-        uint32_t rhs_value = BitmapViewValueAt(rhs, j);
-        if (lhs_value < rhs_value) {
-            out[k++] = lhs_value;
-            i++;
-        } else if (rhs_value < lhs_value) {
-            j++;
-        } else {
-            i++;
-            j++;
-        }
-    }
-    while (i < lhs->count) {
-        out[k++] = BitmapViewValueAt(lhs, i);
-        i++;
-    }
-    *out_count = k;
-    return true;
-}
-
-static bool ApplyBinaryOp(const BitmapView *lhs, const BitmapView *rhs, BitmapBinaryOp op, uint32_t **out_values,
-                          idx_t *out_count) {
-    if (lhs->count > (idx_t)(SIZE_MAX - rhs->count)) {
-        return false;
-    }
-    idx_t max_count = 0;
-    switch (op) {
-    case BITMAP_OP_OR:
-        max_count = lhs->count + rhs->count;
-        break;
-    case BITMAP_OP_AND:
-        max_count = lhs->count < rhs->count ? lhs->count : rhs->count;
-        break;
-    case BITMAP_OP_ANDNOT:
-        max_count = lhs->count;
-        break;
-    }
-    uint32_t *values = NULL;
-    if (max_count > 0) {
-        if (max_count > (idx_t)(SIZE_MAX / sizeof(uint32_t))) {
-            return false;
-        }
-        values = (uint32_t *)malloc((size_t)max_count * sizeof(uint32_t));
-        if (values == NULL) {
-            return false;
-        }
-    }
-
-    bool ok = true;
-    switch (op) {
-    case BITMAP_OP_OR:
-        ok = MergeOr(lhs, rhs, values, out_count);
-        break;
-    case BITMAP_OP_AND:
-        ok = MergeAnd(lhs, rhs, values, out_count);
-        break;
-    case BITMAP_OP_ANDNOT:
-        ok = MergeAndNot(lhs, rhs, values, out_count);
-        break;
-    }
-
-    if (!ok) {
-        free(values);
-        return false;
-    }
-
-    *out_values = values;
-    return true;
-}
 
 static bool BitmapContainsValue(const BitmapView *view, uint64_t needle) {
     if (needle > UINT32_MAX) {
@@ -410,274 +285,11 @@ static idx_t BitmapLowerBoundGreaterThan(const BitmapView *view, int64_t start_a
     return low;
 }
 
-static uint64_t CountOr(const BitmapView *lhs, const BitmapView *rhs) {
-    idx_t i = 0;
-    idx_t j = 0;
-    uint64_t count = 0;
-    while (i < lhs->count && j < rhs->count) {
-        uint32_t lhs_value = BitmapViewValueAt(lhs, i);
-        uint32_t rhs_value = BitmapViewValueAt(rhs, j);
-        if (lhs_value < rhs_value) {
-            i++;
-        } else if (rhs_value < lhs_value) {
-            j++;
-        } else {
-            i++;
-            j++;
-        }
-        count++;
-    }
-    count += (uint64_t)(lhs->count - i);
-    count += (uint64_t)(rhs->count - j);
-    return count;
-}
-
-static uint64_t CountAnd(const BitmapView *lhs, const BitmapView *rhs) {
-    idx_t i = 0;
-    idx_t j = 0;
-    uint64_t count = 0;
-    while (i < lhs->count && j < rhs->count) {
-        uint32_t lhs_value = BitmapViewValueAt(lhs, i);
-        uint32_t rhs_value = BitmapViewValueAt(rhs, j);
-        if (lhs_value < rhs_value) {
-            i++;
-        } else if (rhs_value < lhs_value) {
-            j++;
-        } else {
-            count++;
-            i++;
-            j++;
-        }
-    }
-    return count;
-}
-
-static uint64_t CountAndNot(const BitmapView *lhs, const BitmapView *rhs) {
-    idx_t i = 0;
-    idx_t j = 0;
-    uint64_t count = 0;
-    while (i < lhs->count && j < rhs->count) {
-        uint32_t lhs_value = BitmapViewValueAt(lhs, i);
-        uint32_t rhs_value = BitmapViewValueAt(rhs, j);
-        if (lhs_value < rhs_value) {
-            count++;
-            i++;
-        } else if (rhs_value < lhs_value) {
-            j++;
-        } else {
-            i++;
-            j++;
-        }
-    }
-    count += (uint64_t)(lhs->count - i);
-    return count;
-}
-
-static bool BitmapsIntersect(const BitmapView *lhs, const BitmapView *rhs) {
-    idx_t i = 0;
-    idx_t j = 0;
-    while (i < lhs->count && j < rhs->count) {
-        uint32_t lhs_value = BitmapViewValueAt(lhs, i);
-        uint32_t rhs_value = BitmapViewValueAt(rhs, j);
-        if (lhs_value < rhs_value) {
-            i++;
-        } else if (rhs_value < lhs_value) {
-            j++;
-        } else {
-            return true;
-        }
-    }
-    return false;
-}
-
-static int CompareUint32(const void *lhs, const void *rhs) {
-    uint32_t a = *(const uint32_t *)lhs;
-    uint32_t b = *(const uint32_t *)rhs;
-    if (a < b) {
-        return -1;
-    }
-    if (a > b) {
-        return 1;
-    }
-    return 0;
-}
 
 typedef struct BitmapAggState {
     roaring_bitmap_t *rb;
     bool failed;
 } BitmapAggState;
-
-static bool EnsureAggCapacity(BitmapAggState *state, idx_t extra) {
-    if (extra == 0) {
-        return true;
-    }
-    if (state->count > (idx_t)(SIZE_MAX - extra)) {
-        return false;
-    }
-    idx_t required = state->count + extra;
-    if (required <= state->capacity) {
-        return true;
-    }
-
-    idx_t new_capacity = state->capacity == 0 ? 1024 : state->capacity;
-    while (new_capacity < required) {
-        if (new_capacity > (idx_t)(SIZE_MAX / 2)) {
-            new_capacity = required;
-            break;
-        }
-        new_capacity *= 2;
-    }
-    if (new_capacity > (idx_t)(SIZE_MAX / sizeof(uint32_t))) {
-        return false;
-    }
-
-    uint32_t *new_values = (uint32_t *)realloc(state->values, (size_t)new_capacity * sizeof(uint32_t));
-    if (new_values == NULL) {
-        return false;
-    }
-    state->values = new_values;
-    state->capacity = new_capacity;
-    return true;
-}
-
-static bool AppendAggValue(BitmapAggState *state, uint32_t value) {
-    if (!EnsureAggCapacity(state, 1)) {
-        return false;
-    }
-    state->values[state->count++] = value;
-    return true;
-}
-
-static idx_t SortDeduplicateAggState(BitmapAggState *state) {
-    if (state->count > 1) {
-        qsort(state->values, (size_t)state->count, sizeof(uint32_t), CompareUint32);
-    }
-
-    idx_t unique_count = 0;
-    for (idx_t i = 0; i < state->count; i++) {
-        if (i == 0 || state->values[i] != state->values[i - 1]) {
-            state->values[unique_count++] = state->values[i];
-        }
-    }
-    state->count = unique_count;
-    return unique_count;
-}
-
-static bool MergeAggSortedWithBitmapView(BitmapAggState *state, const BitmapView *view) {
-    if (view->count == 0) {
-        return true;
-    }
-    if (state->count == 0) {
-        if (!EnsureAggCapacity(state, view->count)) {
-            return false;
-        }
-        for (idx_t i = 0; i < view->count; i++) {
-            state->values[i] = BitmapViewValueAt(view, i);
-        }
-        state->count = view->count;
-        return true;
-    }
-    if (state->count > (idx_t)(SIZE_MAX - view->count)) {
-        return false;
-    }
-
-    idx_t max_count = state->count + view->count;
-    if (max_count > (idx_t)(SIZE_MAX / sizeof(uint32_t))) {
-        return false;
-    }
-    uint32_t *merged = (uint32_t *)malloc((size_t)max_count * sizeof(uint32_t));
-    if (merged == NULL) {
-        return false;
-    }
-
-    idx_t i = 0;
-    idx_t j = 0;
-    idx_t k = 0;
-    while (i < state->count && j < view->count) {
-        uint32_t lhs_value = state->values[i];
-        uint32_t rhs_value = BitmapViewValueAt(view, j);
-        if (lhs_value < rhs_value) {
-            merged[k++] = lhs_value;
-            i++;
-        } else if (rhs_value < lhs_value) {
-            merged[k++] = rhs_value;
-            j++;
-        } else {
-            merged[k++] = lhs_value;
-            i++;
-            j++;
-        }
-    }
-    while (i < state->count) {
-        merged[k++] = state->values[i++];
-    }
-    while (j < view->count) {
-        merged[k++] = BitmapViewValueAt(view, j++);
-    }
-
-    free(state->values);
-    state->values = merged;
-    state->count = k;
-    state->capacity = max_count;
-    return true;
-}
-
-static bool MergeAggSortedValues(BitmapAggState *target, const uint32_t *values, idx_t value_count) {
-    if (value_count == 0) {
-        return true;
-    }
-    if (target->count == 0) {
-        if (!EnsureAggCapacity(target, value_count)) {
-            return false;
-        }
-        memcpy(target->values, values, (size_t)value_count * sizeof(uint32_t));
-        target->count = value_count;
-        return true;
-    }
-    if (target->count > (idx_t)(SIZE_MAX - value_count)) {
-        return false;
-    }
-
-    idx_t max_count = target->count + value_count;
-    if (max_count > (idx_t)(SIZE_MAX / sizeof(uint32_t))) {
-        return false;
-    }
-    uint32_t *merged = (uint32_t *)malloc((size_t)max_count * sizeof(uint32_t));
-    if (merged == NULL) {
-        return false;
-    }
-
-    idx_t i = 0;
-    idx_t j = 0;
-    idx_t k = 0;
-    while (i < target->count && j < value_count) {
-        uint32_t lhs_value = target->values[i];
-        uint32_t rhs_value = values[j];
-        if (lhs_value < rhs_value) {
-            merged[k++] = lhs_value;
-            i++;
-        } else if (rhs_value < lhs_value) {
-            merged[k++] = rhs_value;
-            j++;
-        } else {
-            merged[k++] = lhs_value;
-            i++;
-            j++;
-        }
-    }
-    while (i < target->count) {
-        merged[k++] = target->values[i++];
-    }
-    while (j < value_count) {
-        merged[k++] = values[j++];
-    }
-
-    free(target->values);
-    target->values = merged;
-    target->count = k;
-    target->capacity = max_count;
-    return true;
-}
 
 static void BitmapHello(duckdb_function_info info, duckdb_data_chunk input, duckdb_vector output) {
     (void)info;
@@ -1313,8 +925,8 @@ static void BitmapToRowsFunction(duckdb_function_info info, duckdb_data_chunk in
             roaring_uint32_iterator_t *it = roaring_iterator_create(rb);
             out_entries[row].offset = (uint64_t)child_offset;
             idx_t i = 0;
-            while (roaring_uint32_iterator_has_value(it)) {
-                child_data[child_offset + i++] = (uint64_t)roaring_uint32_iterator_value(it);
+            while (it->has_value) {
+                child_data[child_offset + i++] = (uint64_t)it->current_value;
                 roaring_uint32_iterator_advance(it);
             }
             out_entries[row].length = (uint64_t)i;
@@ -1367,11 +979,11 @@ static void BitmapToRowsLimitedFunction(duckdb_function_info info, duckdb_data_c
             uint32_t threshold_u32 = (threshold < 0 || (uint64_t)threshold >= UINT32_MAX) ? UINT32_MAX : (uint32_t)(threshold + 1);
             roaring_uint32_iterator_t *it = roaring_iterator_create(rb);
             if (threshold_u32 < UINT32_MAX) {
-                while (roaring_uint32_iterator_has_value(it) && roaring_uint32_iterator_value(it) < threshold_u32) {
+                while (it->has_value && it->current_value < threshold_u32) {
                     roaring_uint32_iterator_advance(it);
                 }
             }
-            while (roaring_uint32_iterator_has_value(it) && emit_count < limit) {
+            while (it->has_value && emit_count < limit) {
                 emit_count++;
                 roaring_uint32_iterator_advance(it);
             }
@@ -1440,12 +1052,12 @@ static void BitmapToRowsLimitedFunction(duckdb_function_info info, duckdb_data_c
             uint32_t threshold_u32 = (threshold < 0 || (uint64_t)threshold >= UINT32_MAX) ? UINT32_MAX : (uint32_t)(threshold + 1);
             roaring_uint32_iterator_t *it = roaring_iterator_create(rb);
             if (threshold_u32 < UINT32_MAX) {
-                while (roaring_uint32_iterator_has_value(it) && roaring_uint32_iterator_value(it) < threshold_u32) {
+                while (it->has_value && it->current_value < threshold_u32) {
                     roaring_uint32_iterator_advance(it);
                 }
             }
-            while (roaring_uint32_iterator_has_value(it) && i < limit) {
-                child_data[child_offset + i++] = (uint64_t)roaring_uint32_iterator_value(it);
+            while (it->has_value && i < limit) {
+                child_data[child_offset + i++] = (uint64_t)it->current_value;
                 roaring_uint32_iterator_advance(it);
             }
             roaring_uint32_iterator_free(it);
@@ -1702,27 +1314,6 @@ static void BitmapAggFinalize(duckdb_function_info info, duckdb_aggregate_state 
         if (created_empty) {
             roaring_bitmap_free(rb);
         }
-    }
-}
-
-static void BitmapSortedAggFinalize(duckdb_function_info info, duckdb_aggregate_state *source, duckdb_vector result,
-                                    idx_t count, idx_t offset) {
-    for (idx_t i = 0; i < count; i++) {
-        BitmapAggState *state = (BitmapAggState *)source[i];
-        if (state->failed) {
-            duckdb_aggregate_function_set_error(info, "bitmap aggregate state is failed");
-            return;
-        }
-
-        uint8_t *blob_bytes = NULL;
-        idx_t blob_size = 0;
-        if (!MakeBitmapBlobBytes(state->values, state->count, &blob_bytes, &blob_size)) {
-            duckdb_aggregate_function_set_error(info, "out of memory while finalizing bitmap aggregate");
-            return;
-        }
-
-        duckdb_vector_assign_string_element_len(result, offset + i, (const char *)blob_bytes, blob_size);
-        free(blob_bytes);
     }
 }
 

@@ -641,7 +641,23 @@ static inline uint32_t croaring_refcount_get(const croaring_refcount_t *val) {
     return *val;
 }
 #else
-#error "Unknown atomic implementation"
+// Fallback to non-atomic implementation if no other implementation is available
+#include <assert.h>
+typedef uint32_t croaring_refcount_t;
+
+static inline void croaring_refcount_inc(croaring_refcount_t *val) {
+    *val += 1;
+}
+
+static inline bool croaring_refcount_dec(croaring_refcount_t *val) {
+    assert(*val > 0);
+    *val -= 1;
+    return val == 0;
+}
+
+static inline uint32_t croaring_refcount_get(const croaring_refcount_t *val) {
+    return *val;
+}
 #endif
 
 #if defined(__GNUC__) || defined(__clang__)
