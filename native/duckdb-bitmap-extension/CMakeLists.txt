@@ -7,10 +7,12 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 
 add_library(bitmap SHARED
     src/bitmap_extension.c
+    src/roaring.c
 )
 
 target_include_directories(bitmap PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/duckdb_capi
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
 target_compile_definitions(bitmap PRIVATE
@@ -21,7 +23,13 @@ target_compile_definitions(bitmap PRIVATE
 )
 
 if(MSVC)
-    target_compile_definitions(bitmap PRIVATE _CRT_SECURE_NO_WARNINGS)
+    target_compile_definitions(bitmap PRIVATE
+        _CRT_SECURE_NO_WARNINGS
+        ROARING_DISABLE_AVX
+    )
+    set_source_files_properties(src/roaring.c PROPERTIES
+        COMPILE_FLAGS "/wd4996 /wd4267 /wd4244 /wd4146"
+    )
 endif()
 
 set_target_properties(bitmap PROPERTIES

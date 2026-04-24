@@ -6,6 +6,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "roaring.h"
+
 DUCKDB_EXTENSION_EXTERN
 
 // Bitmap scalars use an FPBM envelope with sorted unique uint32 payloads.
@@ -16,6 +18,7 @@ DUCKDB_EXTENSION_EXTERN
 #define BITMAP_MAGIC_3 'M'
 #define BITMAP_FORMAT_VERSION 1
 #define BITMAP_ENCODING_SORTED_U32 1
+#define BITMAP_ENCODING_ROARING32  2
 #define BITMAP_HEADER_SIZE 12
 
 typedef struct BitmapView {
@@ -72,7 +75,8 @@ static bool ParseBitmapBlobBytes(duckdb_function_info info, const uint8_t *data,
         SetFunctionError(info, "invalid bitmap blob: unsupported version");
         return false;
     }
-    if (data[5] != BITMAP_ENCODING_SORTED_U32) {
+    uint8_t encoding = data[5];
+    if (encoding != BITMAP_ENCODING_SORTED_U32 && encoding != BITMAP_ENCODING_ROARING32) {
         SetFunctionError(info, "invalid bitmap blob: unsupported payload encoding");
         return false;
     }
@@ -86,16 +90,26 @@ static bool ParseBitmapBlobBytes(duckdb_function_info info, const uint8_t *data,
         SetFunctionError(info, "invalid bitmap blob: payload length mismatch");
         return false;
     }
-    if ((payload_len % 4U) != 0U) {
-        SetFunctionError(info, "invalid bitmap blob: payload length must be a multiple of 4");
-        return false;
+    /* The 4-byte alignment check is sorted_u32 specific; roaring32 has variable-length serialization */
+    if (encoding == BITMAP_ENCODING_SORTED_U32) {
+        if ((payload_len % 4U) != 0U) {
+            SetFunctionError(info, "invalid bitmap blob: payload length must be a multiple of 4");
+            return false;
+        }
     }
+
     out->payload = data + BITMAP_HEADER_SIZE;
-    out->count = (idx_t)(payload_len / 4U);
+    /* count field: for sorted_u32 it is the element count; for roaring32 it is a sentinel (0)
+       and must be computed on demand via BitmapViewCardinality() */
+    if (encoding == BITMAP_ENCODING_SORTED_U32) {
+        out->count = (idx_t)(payload_len / 4U);
+    } else {
+        out->count = 0;
+    }
     out->payload_size = (idx_t)payload_len;
     out->total_size = size;
     out->version = data[4];
-    out->encoding = data[5];
+    out->encoding = encoding;
     return true;
 }
 
@@ -107,6 +121,50 @@ static bool ParseBitmapBlob(duckdb_function_info info, duckdb_vector vector, idx
 
 static uint32_t BitmapViewValueAt(const BitmapView *view, idx_t index) {
     return ReadU32LE(view->payload + (index * 4));
+}
+
+/* CRoaring integration helpers */
+
+/* Deserialize a roaring32 payload to a heap-allocated bitmap.
+   Caller MUST call roaring_bitmap_free() on the result.
+   Returns NULL on failure (malformed data). */
+static roaring_bitmap_t *BitmapViewDeserializeRoaring(const BitmapView *view) {
+    return roaring_bitmap_portable_deserialize_safe(
+        (const char *)view->payload, (size_t)view->payload_size);
+}
+
+/* Returns element count for any encoding.
+   For sorted_u32 this is O(1). For roaring32 it deserializes, counts, frees. */
+static uint64_t BitmapViewCardinality(const BitmapView *view) {
+    if (view->encoding == BITMAP_ENCODING_SORTED_U32) {
+        return (uint64_t)view->count;
+    }
+    roaring_bitmap_t *rb = BitmapViewDeserializeRoaring(view);
+    if (rb == NULL) return 0;
+    uint64_t c = roaring_bitmap_get_cardinality(rb);
+    roaring_bitmap_free(rb);
+    return c;
+}
+
+/* Converts any BitmapView to heap-owned roaring_bitmap_t.
+   Caller MUST roaring_bitmap_free() the result.
+   For sorted_u32: builds a new roaring bitmap from the uint32 array (all DuckDB targets are LE).
+   For roaring32: deserializes the portable format.
+   Returns NULL on OOM or bad data. */
+static roaring_bitmap_t *BitmapViewToRoaring(const BitmapView *view) {
+    if (view->encoding == BITMAP_ENCODING_SORTED_U32) {
+        roaring_bitmap_t *rb = roaring_bitmap_create();
+        if (rb == NULL) return NULL;
+        if (view->count > 0) {
+            /* view->payload is a little-endian uint32 array; roaring_bitmap_add_many expects
+               host-endian uint32 values. This cast is safe on LE platforms (all DuckDB targets). */
+            roaring_bitmap_add_many(rb, (size_t)view->count,
+                                    (const uint32_t *)view->payload);
+        }
+        return rb;
+    }
+    /* BITMAP_ENCODING_ROARING32 */
+    return BitmapViewDeserializeRoaring(view);
 }
 
 static bool MakeBitmapBlobBytes(const uint32_t *values, idx_t count, uint8_t **out_data, idx_t *out_size) {
@@ -134,6 +192,41 @@ static bool MakeBitmapBlobBytes(const uint32_t *values, idx_t count, uint8_t **o
     for (idx_t i = 0; i < count; i++) {
         WriteU32LE(data + BITMAP_HEADER_SIZE + (i * 4), values[i]);
     }
+
+    *out_data = data;
+    *out_size = total_len;
+    return true;
+}
+
+/* Serialize a roaring_bitmap_t to an FPBM blob with encoding=2 (ROARING32).
+   Applies run-length optimization before serializing.
+   Caller owns the returned buffer; free() it when done.
+   Returns false on OOM or if roaring bitmap is invalid. */
+static bool MakeRoaringBlobBytes(roaring_bitmap_t *rb, uint8_t **out_data, idx_t *out_size) {
+    roaring_bitmap_run_optimize(rb);
+
+    size_t payload_len = roaring_bitmap_portable_size_in_bytes(rb);
+    if (payload_len > (size_t)UINT32_MAX) {
+        return false;
+    }
+
+    idx_t total_len = BITMAP_HEADER_SIZE + (idx_t)payload_len;
+    uint8_t *data = (uint8_t *)malloc((size_t)total_len);
+    if (data == NULL) {
+        return false;
+    }
+
+    data[0] = BITMAP_MAGIC_0;
+    data[1] = BITMAP_MAGIC_1;
+    data[2] = BITMAP_MAGIC_2;
+    data[3] = BITMAP_MAGIC_3;
+    data[4] = BITMAP_FORMAT_VERSION;
+    data[5] = BITMAP_ENCODING_ROARING32;
+    data[6] = 0;
+    data[7] = 0;
+    WriteU32LE(data + 8, (uint32_t)payload_len);
+
+    roaring_bitmap_portable_serialize(rb, (char *)(data + BITMAP_HEADER_SIZE));
 
     *out_data = data;
     *out_size = total_len;
@@ -401,9 +494,7 @@ static int CompareUint32(const void *lhs, const void *rhs) {
 }
 
 typedef struct BitmapAggState {
-    uint32_t *values;
-    idx_t count;
-    idx_t capacity;
+    roaring_bitmap_t *rb;
     bool failed;
 } BitmapAggState;
 
@@ -788,7 +879,7 @@ static void BitmapCountFunction(duckdb_function_info info, duckdb_data_chunk inp
         if (!ParseBitmapBlob(info, bitmap_vector, row, &bitmap)) {
             return;
         }
-        out_data[row] = (uint64_t)bitmap.count;
+        out_data[row] = BitmapViewCardinality(&bitmap);
     }
 }
 
@@ -1245,9 +1336,7 @@ static idx_t BitmapAggStateSize(duckdb_function_info info) {
 static void BitmapAggInit(duckdb_function_info info, duckdb_aggregate_state state) {
     (void)info;
     BitmapAggState *agg = (BitmapAggState *)state;
-    agg->values = NULL;
-    agg->count = 0;
-    agg->capacity = 0;
+    agg->rb = NULL;
     agg->failed = false;
 }
 
@@ -1257,10 +1346,10 @@ static void BitmapAggDestroy(duckdb_aggregate_state *states, idx_t count) {
         if (state == NULL) {
             continue;
         }
-        free(state->values);
-        state->values = NULL;
-        state->count = 0;
-        state->capacity = 0;
+        if (state->rb != NULL) {
+            roaring_bitmap_free(state->rb);
+            state->rb = NULL;
+        }
     }
 }
 
@@ -1284,11 +1373,15 @@ static void BitmapBuildAggUpdate(duckdb_function_info info, duckdb_data_chunk in
         }
 
         BitmapAggState *state = (BitmapAggState *)states[row];
-        if (!AppendAggValue(state, (uint32_t)row_id)) {
-            state->failed = true;
-            duckdb_aggregate_function_set_error(info, "out of memory while updating bm_build_agg");
-            return;
+        if (state->rb == NULL) {
+            state->rb = roaring_bitmap_create();
+            if (state->rb == NULL) {
+                state->failed = true;
+                duckdb_aggregate_function_set_error(info, "out of memory while updating bm_build_agg");
+                return;
+            }
         }
+        roaring_bitmap_add(state->rb, (uint32_t)row_id);
     }
 }
 
@@ -1302,18 +1395,37 @@ static void BitmapOrAggUpdate(duckdb_function_info info, duckdb_data_chunk input
             continue;
         }
 
-        BitmapView bitmap = {0};
-        if (!ParseBitmapBlob(info, bitmap_vector, row, &bitmap)) {
+        BitmapView view = {0};
+        if (!ParseBitmapBlob(info, bitmap_vector, row, &view)) {
             BitmapAggState *state = (BitmapAggState *)states[row];
             state->failed = true;
             return;
         }
 
         BitmapAggState *state = (BitmapAggState *)states[row];
-        if (!MergeAggSortedWithBitmapView(state, &bitmap)) {
-            state->failed = true;
-            duckdb_aggregate_function_set_error(info, "out of memory while updating bm_or_agg");
-            return;
+        if (state->rb == NULL) {
+            state->rb = roaring_bitmap_create();
+            if (state->rb == NULL) {
+                state->failed = true;
+                duckdb_aggregate_function_set_error(info, "out of memory while updating bm_or_agg");
+                return;
+            }
+        }
+
+        if (view.encoding == BITMAP_ENCODING_SORTED_U32) {
+            /* Fast path: bulk-add sorted u32 array (all DuckDB targets are LE) */
+            roaring_bitmap_add_many(state->rb, (size_t)view.count,
+                                    (const uint32_t *)view.payload);
+        } else {
+            /* roaring32 path: deserialize, OR in, free */
+            roaring_bitmap_t *incoming = BitmapViewDeserializeRoaring(&view);
+            if (incoming == NULL) {
+                state->failed = true;
+                duckdb_aggregate_function_set_error(info, "failed to deserialize bitmap in bm_or_agg");
+                return;
+            }
+            roaring_bitmap_or_inplace(state->rb, incoming);
+            roaring_bitmap_free(incoming);
         }
     }
 }
@@ -1329,36 +1441,27 @@ static void BitmapAggCombine(duckdb_function_info info, duckdb_aggregate_state *
             duckdb_aggregate_function_set_error(info, "bitmap aggregate state is failed");
             return;
         }
-        if (!EnsureAggCapacity(target_state, source_state->count)) {
-            target_state->failed = true;
-            duckdb_aggregate_function_set_error(info, "out of memory while combining bitmap aggregate states");
-            return;
+        if (source_state->rb == NULL) {
+            continue;
         }
-        if (source_state->count > 0) {
-            memcpy(target_state->values + target_state->count, source_state->values,
-                   (size_t)source_state->count * sizeof(uint32_t));
-            target_state->count += source_state->count;
+
+        if (target_state->rb == NULL) {
+            target_state->rb = roaring_bitmap_copy(source_state->rb);
+            if (target_state->rb == NULL) {
+                target_state->failed = true;
+                duckdb_aggregate_function_set_error(info, "out of memory while combining bitmap aggregate states");
+                return;
+            }
+        } else {
+            roaring_bitmap_or_inplace(target_state->rb, source_state->rb);
         }
     }
 }
 
 static void BitmapOrAggCombine(duckdb_function_info info, duckdb_aggregate_state *source, duckdb_aggregate_state *target,
                                idx_t count) {
-    for (idx_t i = 0; i < count; i++) {
-        BitmapAggState *source_state = (BitmapAggState *)source[i];
-        BitmapAggState *target_state = (BitmapAggState *)target[i];
-
-        if (source_state->failed || target_state->failed) {
-            target_state->failed = true;
-            duckdb_aggregate_function_set_error(info, "bitmap aggregate state is failed");
-            return;
-        }
-        if (!MergeAggSortedValues(target_state, source_state->values, source_state->count)) {
-            target_state->failed = true;
-            duckdb_aggregate_function_set_error(info, "out of memory while combining bm_or_agg states");
-            return;
-        }
-    }
+    /* bm_or_agg combine is identical to bm_build_agg combine (both OR roaring bitmaps) */
+    BitmapAggCombine(info, source, target, count);
 }
 
 static void BitmapAggFinalize(duckdb_function_info info, duckdb_aggregate_state *source, duckdb_vector result,
@@ -1370,16 +1473,32 @@ static void BitmapAggFinalize(duckdb_function_info info, duckdb_aggregate_state 
             return;
         }
 
-        idx_t unique_count = SortDeduplicateAggState(state);
+        roaring_bitmap_t *rb = state->rb;
+        bool created_empty = false;
+        if (rb == NULL) {
+            rb = roaring_bitmap_create();
+            if (rb == NULL) {
+                duckdb_aggregate_function_set_error(info, "out of memory while finalizing bitmap aggregate");
+                return;
+            }
+            created_empty = true;
+        }
+
         uint8_t *blob_bytes = NULL;
         idx_t blob_size = 0;
-        if (!MakeBitmapBlobBytes(state->values, unique_count, &blob_bytes, &blob_size)) {
+        if (!MakeRoaringBlobBytes(rb, &blob_bytes, &blob_size)) {
+            if (created_empty) {
+                roaring_bitmap_free(rb);
+            }
             duckdb_aggregate_function_set_error(info, "out of memory while finalizing bitmap aggregate");
             return;
         }
 
         duckdb_vector_assign_string_element_len(result, offset + i, (const char *)blob_bytes, blob_size);
         free(blob_bytes);
+        if (created_empty) {
+            roaring_bitmap_free(rb);
+        }
     }
 }
 
@@ -1684,7 +1803,7 @@ static void RegisterOrAggBitmapFunction(duckdb_connection connection) {
     duckdb_destroy_logical_type(&blob_type);
 
     duckdb_aggregate_function_set_functions(function, BitmapAggStateSize, BitmapAggInit, BitmapOrAggUpdate,
-                                            BitmapOrAggCombine, BitmapSortedAggFinalize);
+                                            BitmapOrAggCombine, BitmapAggFinalize);
     duckdb_aggregate_function_set_destructor(function, BitmapAggDestroy);
     duckdb_aggregate_function_set_special_handling(function);
 
