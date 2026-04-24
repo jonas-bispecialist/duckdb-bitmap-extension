@@ -7,7 +7,8 @@ param(
     [switch]$Unsigned,
     [string]$DatabasePath = (Join-Path $PSScriptRoot "bitmap-ext-tpch.duckdb"),
     [string]$WorkloadsRoot = (Join-Path $PSScriptRoot "workloads"),
-    [switch]$RebuildData
+    [switch]$RebuildData,
+    [switch]$RebuildBitmaps
 )
 
 $ErrorActionPreference = "Stop"
@@ -107,12 +108,58 @@ function Measure-Workload {
     }
 }
 
+function Invoke-TimedStage {
+    param(
+        [Parameter(Mandatory = $true)][string]$StageName,
+        [Parameter(Mandatory = $true)][string]$Sql,
+        [Parameter(Mandatory = $true)][string]$DatabasePath
+    )
+
+    $elapsed = [System.Diagnostics.Stopwatch]::StartNew()
+    Invoke-DuckDb -Sql $Sql -DatabasePath $DatabasePath | Out-Null
+    $elapsed.Stop()
+
+    $ms = [Math]::Round($elapsed.Elapsed.TotalMilliseconds, 3)
+    Write-Host ("{0}: {1} ms" -f $StageName, $ms)
+
+    return [pscustomobject]@{
+        workload = $StageName
+        scale_factor = $ScaleFactor
+        iterations = 1
+        warmup = 0
+        avg_ms = $ms
+        min_ms = $ms
+        p95_ms = $ms
+        max_ms = $ms
+        rows = 0
+    }
+}
+
+function Get-PreparedSql {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [switch]$IncludeExtensionLoad
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        throw "SQL file not found: $Path"
+    }
+
+    $sql = ((Get-Content -LiteralPath $Path -Raw).Trim() -replace '\{\{SCALE_FACTOR\}\}', $ScaleFactor)
+    $parts = New-Object System.Collections.Generic.List[string]
+    if ($IncludeExtensionLoad -and -not [string]::IsNullOrWhiteSpace($ExtensionLoadSql)) {
+        $parts.Add($ExtensionLoadSql.Trim().TrimEnd(";"))
+    }
+    $parts.Add($sql.Trim().TrimEnd(";"))
+    return (($parts -join ";`n") + ";")
+}
+
 if (-not (Test-Path -LiteralPath $WorkloadsRoot)) {
     throw "Workloads root not found: $WorkloadsRoot"
 }
 
 $workloadFiles = @(Get-ChildItem -LiteralPath $WorkloadsRoot -File -Filter *.sql |
-    Where-Object { $_.Name -ne "prepare-tpch.sql" } |
+    Where-Object { $_.Name -notin @("prepare-tpch.sql", "prepare-tpch-data.sql", "prepare-bitmaps.sql") } |
     Sort-Object Name)
 
 if ($workloadFiles.Count -eq 0) {
@@ -122,37 +169,21 @@ if ($workloadFiles.Count -eq 0) {
 $outputRoot = Join-Path $PSScriptRoot "out"
 New-Item -ItemType Directory -Path $outputRoot -Force | Out-Null
 
-if ($RebuildData -or -not (Test-Path -LiteralPath $DatabasePath)) {
-    $preparePath = Join-Path $WorkloadsRoot "prepare-tpch.sql"
-    $prepareSql = if (Test-Path -LiteralPath $preparePath) {
-        ((Get-Content -LiteralPath $preparePath -Raw).Trim() -replace '\{\{SCALE_FACTOR\}\}', $ScaleFactor)
-    }
-    else {
-        @(
-            "INSTALL tpch",
-            "LOAD tpch",
-            "DROP TABLE IF EXISTS customer",
-            "DROP TABLE IF EXISTS lineitem",
-            "DROP TABLE IF EXISTS nation",
-            "DROP TABLE IF EXISTS orders",
-            "DROP TABLE IF EXISTS part",
-            "DROP TABLE IF EXISTS partsupp",
-            "DROP TABLE IF EXISTS region",
-            "DROP TABLE IF EXISTS supplier",
-            "CALL dbgen(sf = $ScaleFactor)"
-        ) -join ";`n"
-    }
+$results = New-Object System.Collections.Generic.List[object]
 
-    $prepareParts = New-Object System.Collections.Generic.List[string]
-    if (-not [string]::IsNullOrWhiteSpace($ExtensionLoadSql)) {
-        $prepareParts.Add($ExtensionLoadSql.Trim().TrimEnd(";"))
-    }
-    $prepareParts.Add($prepareSql.Trim().TrimEnd(";"))
-
-    Invoke-DuckDb -Sql (($prepareParts -join ";`n") + ";") -DatabasePath $DatabasePath | Out-Null
+$databaseExists = Test-Path -LiteralPath $DatabasePath
+if ($RebuildData -or -not $databaseExists) {
+    $prepareDataPath = Join-Path $WorkloadsRoot "prepare-tpch-data.sql"
+    $prepareDataSql = Get-PreparedSql -Path $prepareDataPath
+    $results.Add((Invoke-TimedStage -StageName "00_prepare_data" -Sql $prepareDataSql -DatabasePath $DatabasePath))
+    $RebuildBitmaps = $true
 }
 
-$results = New-Object System.Collections.Generic.List[object]
+if ($RebuildBitmaps) {
+    $prepareBitmapsPath = Join-Path $WorkloadsRoot "prepare-bitmaps.sql"
+    $prepareBitmapsSql = Get-PreparedSql -Path $prepareBitmapsPath -IncludeExtensionLoad
+    $results.Add((Invoke-TimedStage -StageName "00_build_bitmaps" -Sql $prepareBitmapsSql -DatabasePath $DatabasePath))
+}
 
 foreach ($workloadFile in $workloadFiles) {
     $workloadName = [System.IO.Path]::GetFileNameWithoutExtension($workloadFile.Name)
