@@ -1,0 +1,2 @@
+sorted_reencoded_format,sorted_reencoded_count,sorted_contains_5,sorted_contains_7,roaring_passthrough,null_reencode
+roaring32_v1,3,true,false,true,true

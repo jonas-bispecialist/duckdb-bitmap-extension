@@ -1245,6 +1245,40 @@ static void BitmapOrAggUpdate(duckdb_function_info info, duckdb_data_chunk input
     }
 }
 
+static void BitmapAndAggUpdate(duckdb_function_info info, duckdb_data_chunk input, duckdb_aggregate_state *states) {
+    idx_t row_count = duckdb_data_chunk_get_size(input);
+    duckdb_vector bitmap_vector = duckdb_data_chunk_get_vector(input, 0);
+    uint64_t *bitmap_validity = duckdb_vector_get_validity(bitmap_vector);
+
+    for (idx_t row = 0; row < row_count; row++) {
+        if (!RowIsValid(bitmap_validity, row)) {
+            continue;
+        }
+
+        BitmapView view = {0};
+        if (!ParseBitmapBlob(info, bitmap_vector, row, &view)) {
+            BitmapAggState *state = (BitmapAggState *)states[row];
+            state->failed = true;
+            return;
+        }
+
+        BitmapAggState *state = (BitmapAggState *)states[row];
+        roaring_bitmap_t *incoming = BitmapViewToRoaring(&view);
+        if (incoming == NULL) {
+            state->failed = true;
+            duckdb_aggregate_function_set_error(info, "out of memory while updating bm_and_agg");
+            return;
+        }
+
+        if (state->rb == NULL) {
+            state->rb = incoming;
+        } else {
+            roaring_bitmap_and_inplace(state->rb, incoming);
+            roaring_bitmap_free(incoming);
+        }
+    }
+}
+
 static void BitmapAggCombine(duckdb_function_info info, duckdb_aggregate_state *source, duckdb_aggregate_state *target,
                              idx_t count) {
     for (idx_t i = 0; i < count; i++) {
@@ -1277,6 +1311,34 @@ static void BitmapOrAggCombine(duckdb_function_info info, duckdb_aggregate_state
                                idx_t count) {
     /* bm_or_agg combine is identical to bm_build_agg combine (both OR roaring bitmaps) */
     BitmapAggCombine(info, source, target, count);
+}
+
+static void BitmapAndAggCombine(duckdb_function_info info, duckdb_aggregate_state *source, duckdb_aggregate_state *target,
+                                idx_t count) {
+    for (idx_t i = 0; i < count; i++) {
+        BitmapAggState *source_state = (BitmapAggState *)source[i];
+        BitmapAggState *target_state = (BitmapAggState *)target[i];
+
+        if (source_state->failed || target_state->failed) {
+            target_state->failed = true;
+            duckdb_aggregate_function_set_error(info, "bitmap aggregate state is failed");
+            return;
+        }
+        if (source_state->rb == NULL) {
+            continue;
+        }
+
+        if (target_state->rb == NULL) {
+            target_state->rb = roaring_bitmap_copy(source_state->rb);
+            if (target_state->rb == NULL) {
+                target_state->failed = true;
+                duckdb_aggregate_function_set_error(info, "out of memory while combining bitmap aggregate states");
+                return;
+            }
+        } else {
+            roaring_bitmap_and_inplace(target_state->rb, source_state->rb);
+        }
+    }
 }
 
 static void BitmapAggFinalize(duckdb_function_info info, duckdb_aggregate_state *source, duckdb_vector result,
@@ -1314,6 +1376,21 @@ static void BitmapAggFinalize(duckdb_function_info info, duckdb_aggregate_state 
         if (created_empty) {
             roaring_bitmap_free(rb);
         }
+    }
+}
+
+static void BitmapCountAndAggFinalize(duckdb_function_info info, duckdb_aggregate_state *source, duckdb_vector result,
+                                      idx_t count, idx_t offset) {
+    uint64_t *out_data = (uint64_t *)duckdb_vector_get_data(result);
+
+    for (idx_t i = 0; i < count; i++) {
+        BitmapAggState *state = (BitmapAggState *)source[i];
+        if (state->failed) {
+            duckdb_aggregate_function_set_error(info, "bitmap aggregate state is failed");
+            return;
+        }
+
+        out_data[offset + i] = state->rb == NULL ? 0 : roaring_bitmap_get_cardinality(state->rb);
     }
 }
 
@@ -1630,6 +1707,53 @@ static void RegisterOrAggBitmapFunction(duckdb_connection connection) {
     duckdb_destroy_aggregate_function(&function);
 }
 
+static void RegisterAndAggBitmapFunction(duckdb_connection connection) {
+    duckdb_aggregate_function function = duckdb_create_aggregate_function();
+    duckdb_aggregate_function_set_name(function, "bm_and_agg");
+
+    duckdb_logical_type blob_type = duckdb_create_logical_type(DUCKDB_TYPE_BLOB);
+    duckdb_aggregate_function_add_parameter(function, blob_type);
+    duckdb_aggregate_function_set_return_type(function, blob_type);
+    duckdb_destroy_logical_type(&blob_type);
+
+    duckdb_aggregate_function_set_functions(function, BitmapAggStateSize, BitmapAggInit, BitmapAndAggUpdate,
+                                            BitmapAndAggCombine, BitmapAggFinalize);
+    duckdb_aggregate_function_set_destructor(function, BitmapAggDestroy);
+    duckdb_aggregate_function_set_special_handling(function);
+
+    if (duckdb_register_aggregate_function(connection, function) == DuckDBError) {
+        duckdb_destroy_aggregate_function(&function);
+        return;
+    }
+
+    duckdb_destroy_aggregate_function(&function);
+}
+
+static void RegisterCountAndAggBitmapFunction(duckdb_connection connection) {
+    duckdb_aggregate_function function = duckdb_create_aggregate_function();
+    duckdb_aggregate_function_set_name(function, "bm_count_and_agg");
+
+    duckdb_logical_type blob_type = duckdb_create_logical_type(DUCKDB_TYPE_BLOB);
+    duckdb_aggregate_function_add_parameter(function, blob_type);
+    duckdb_destroy_logical_type(&blob_type);
+
+    duckdb_logical_type ubigint_type = duckdb_create_logical_type(DUCKDB_TYPE_UBIGINT);
+    duckdb_aggregate_function_set_return_type(function, ubigint_type);
+    duckdb_destroy_logical_type(&ubigint_type);
+
+    duckdb_aggregate_function_set_functions(function, BitmapAggStateSize, BitmapAggInit, BitmapAndAggUpdate,
+                                            BitmapAndAggCombine, BitmapCountAndAggFinalize);
+    duckdb_aggregate_function_set_destructor(function, BitmapAggDestroy);
+    duckdb_aggregate_function_set_special_handling(function);
+
+    if (duckdb_register_aggregate_function(connection, function) == DuckDBError) {
+        duckdb_destroy_aggregate_function(&function);
+        return;
+    }
+
+    duckdb_destroy_aggregate_function(&function);
+}
+
 DUCKDB_EXTENSION_ENTRYPOINT(duckdb_connection connection, duckdb_extension_info info, struct duckdb_extension_access *access) {
     (void)info;
     (void)access;
@@ -1650,5 +1774,7 @@ DUCKDB_EXTENSION_ENTRYPOINT(duckdb_connection connection, duckdb_extension_info 
     RegisterBuildBitmapFunction(connection);
     RegisterBuildAggBitmapFunction(connection);
     RegisterOrAggBitmapFunction(connection);
+    RegisterAndAggBitmapFunction(connection);
+    RegisterCountAndAggBitmapFunction(connection);
     return true;
 }

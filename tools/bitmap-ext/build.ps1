@@ -56,6 +56,8 @@ $zigArgs = @(
     "-D", "DUCKDB_EXTENSION_API_VERSION_MAJOR=1",
     "-D", "DUCKDB_EXTENSION_API_VERSION_MINOR=2",
     "-D", "DUCKDB_EXTENSION_API_VERSION_PATCH=0",
+    "-D", "ROARING_DISABLE_AVX=1",
+    "-D", "CROARING_COMPILER_SUPPORTS_AVX512=0",
     "-I", $includeDir
 )
 $zigArgs += $sourceFiles

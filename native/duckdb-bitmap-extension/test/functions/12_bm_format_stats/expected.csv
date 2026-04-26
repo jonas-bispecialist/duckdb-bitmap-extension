@@ -1,2 +1,2 @@
 format_name,stats,null_format,null_stats
-sorted_u32_v1,encoding=sorted_u32_v1;cardinality=3;serialized_bytes=24;payload_bytes=12,true,true
+roaring32_v1,encoding=roaring32_v1;cardinality=3;serialized_bytes=34;payload_bytes=22;containers=1;array=1;run=0;bitset=0,true,true

@@ -14,4 +14,6 @@ The workload pairs cover:
 
 Fetch workloads use `ORDER BY rid LIMIT 10000` to model a first page/export batch while keeping CSV output from dominating the benchmark.
 
+Full-fetch workloads with `_all` suffix intentionally remove `LIMIT 10000` and materialize every matching row. Use these to evaluate export throughput, not first-page latency.
+
 `prepare-tpch-data.sql` creates the benchmark fact table. `prepare-bitmaps.sql` creates reusable bitmap postings.

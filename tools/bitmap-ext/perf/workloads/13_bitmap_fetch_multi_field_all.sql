@@ -14,8 +14,16 @@ WITH field_bitmaps AS (
 context AS (
     SELECT bm_and_agg(bm) AS bm
     FROM field_bitmaps
-)
-SELECT COUNT(*) AS exported_row_ids
-FROM (
+),
+selected_rows AS (
     SELECT unnest(bm_to_rows((SELECT bm FROM context))) AS rid
-) rows
+)
+SELECT
+    li.rid,
+    li.l_returnflag,
+    li.l_linestatus,
+    li.l_shipmode,
+    li.l_shipdate
+FROM selected_rows
+JOIN li USING (rid)
+ORDER BY li.rid

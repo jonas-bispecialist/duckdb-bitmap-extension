@@ -18,6 +18,8 @@ New functions:
 
 - `bm_build_agg(UBIGINT) -> BLOB`
 - `bm_or_agg(BLOB) -> BLOB`
+- `bm_and_agg(BLOB) -> BLOB`
+- `bm_count_and_agg(BLOB) -> UBIGINT`
 - `bm_count_and(BLOB, BLOB) -> UBIGINT`
 - `bm_count_or(BLOB, BLOB) -> UBIGINT`
 - `bm_count_andnot(BLOB, BLOB) -> UBIGINT`
@@ -51,6 +53,20 @@ Use count-only helpers for count/facet paths:
 
 ```sql
 SELECT bm_count_and(active_filter, candidate_posting);
+```
+
+For multi-field active-row counts, prefer aggregating one bitmap per field and counting the intersection directly. This avoids serializing intermediate `bm_and(...)` results:
+
+```sql
+WITH field_bitmaps AS (
+    SELECT bm_or_agg(bm) AS bm FROM postings_country WHERE value IN ('SE', 'NO')
+    UNION ALL
+    SELECT bm_or_agg(bm) AS bm FROM postings_status WHERE value IN ('Open')
+    UNION ALL
+    SELECT bm_or_agg(bm) AS bm FROM postings_region WHERE value IN ('EMEA')
+)
+SELECT bm_count_and_agg(bm)
+FROM field_bitmaps;
 ```
 
 Fetch first-page rows with bounded row-id expansion:

@@ -1,0 +1,30 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git *)",
+      "Bash(gh *)",
+      "Bash(npm *)",
+      "Bash(yarn *)",
+      "Bash(bun *)",
+      "Bash(cargo *)",
+      "Bash(go *)",
+      "Bash(node *)",
+      "Bash(python *)",
+      "Bash(python3 *)",
+      "Bash(cmake *)",
+      "Bash(make *)",
+      "Bash(find *)",
+      "Bash(grep *)",
+      "Bash(ls *)",
+      "Bash(cat *)",
+      "Bash(head *)",
+      "Bash(tail *)",
+      "Bash(sed *)",
+      "Bash(rg *)",
+      "Bash(jq *)",
+      "Bash(docker ps)",
+      "Bash(docker images)",
+      "Bash(docker logs *)"
+    ]
+  }
+}
